@@ -9,6 +9,3 @@ anyhow = "1.0.100"                                   # error handling
 bytes = "1.11.0"                                     # helps manage buffers
 thiserror = "2.0.17"                                # error handling
 tokio = { version = "1.47.2", features = ["full"] } # async networking
-
-[lib]
-name = "codecrafters_redis"

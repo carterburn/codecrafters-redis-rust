@@ -1,5 +1,8 @@
 use anyhow::Result;
-use codecrafters_redis::server::Redis;
+
+pub mod server;
+
+use server::Redis;
 
 const REDIS_PORT: u16 = 6379;
 
