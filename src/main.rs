@@ -2,7 +2,7 @@ use anyhow::Result;
 
 pub mod server;
 
-use server::Redis;
+use crate::server::Redis;
 
 const REDIS_PORT: u16 = 6379;
 
