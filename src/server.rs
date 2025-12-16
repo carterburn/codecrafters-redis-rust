@@ -1,12 +1,12 @@
 use anyhow::Result;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::net::TcpListener;
+
+use crate::connection::RedisConnection;
 
 pub struct Redis {
     /// TCP Listener on given port
     listener: TcpListener,
+    // Clients connected -> should be join handles or arc of the clients?
 }
 
 impl Redis {
@@ -18,24 +18,12 @@ impl Redis {
 
     pub async fn run(&mut self) -> Result<()> {
         println!("Serving clients");
-        while let Ok((mut client_stream, client_addr)) = self.listener.accept().await {
+        while let Ok((client_stream, client_addr)) = self.listener.accept().await {
             println!("New connection from: {client_addr}");
 
-            tokio::spawn(async move {
-                // Here, we just hardcode our response, but future we will likely want to make a
-                // new struct that represents a client connection to handle that
-                loop {
-                    let mut buf = [0u8; 4096];
-                    let n = client_stream.read(&mut buf).await?;
-                    println!(
-                        "Read {n} bytes from client: {:?}",
-                        str::from_utf8(&buf[..n])
-                    );
-                    client_stream.write_all(b"+PONG\r\n").await?;
-                }
-                #[allow(unreachable_code)]
-                Ok::<(), anyhow::Error>(())
-            });
+            let mut client = RedisConnection::new(client_stream, client_addr);
+
+            tokio::spawn(async move { client.client_loop().await });
         }
         Ok(())
     }
