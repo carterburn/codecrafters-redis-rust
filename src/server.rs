@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
 use anyhow::Result;
 use tokio::net::TcpListener;
 
@@ -7,12 +12,15 @@ pub struct Redis {
     /// TCP Listener on given port
     listener: TcpListener,
     // Clients connected -> should be join handles or arc of the clients?
+    /// The global key/value store
+    db: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Redis {
     pub async fn new(port: u16) -> Result<Self> {
         Ok(Self {
             listener: TcpListener::bind(("127.0.0.1", port)).await?,
+            db: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -21,7 +29,7 @@ impl Redis {
         while let Ok((client_stream, client_addr)) = self.listener.accept().await {
             println!("New connection from: {client_addr}");
 
-            let mut client = RedisConnection::new(client_stream, client_addr);
+            let mut client = RedisConnection::new(client_stream, client_addr, self.db.clone());
 
             tokio::spawn(async move { client.client_loop().await });
         }
