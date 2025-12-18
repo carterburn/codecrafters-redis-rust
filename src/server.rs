@@ -6,14 +6,16 @@ use std::{
 use anyhow::Result;
 use tokio::net::TcpListener;
 
-use crate::connection::RedisConnection;
+use crate::{connection::RedisConnection, server::types::Value};
+
+pub(crate) mod types;
 
 pub struct Redis {
     /// TCP Listener on given port
     listener: TcpListener,
     // Clients connected -> should be join handles or arc of the clients?
     /// The global key/value store
-    db: Arc<RwLock<HashMap<String, String>>>,
+    db: Arc<RwLock<HashMap<String, Value>>>,
 }
 
 impl Redis {
