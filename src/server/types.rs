@@ -1,15 +1,19 @@
 use std::time::Instant;
 
+use bytes::Bytes;
+
+pub(crate) type RedisKey = Bytes;
+
 pub(crate) struct Value {
     /// The actual value
-    value: String,
+    value: Bytes,
 
     /// Last set time (if key was set with expirations)
     expiration: Option<Instant>,
 }
 
 impl Value {
-    pub(crate) fn new(value: String, expiration: Option<Instant>) -> Self {
+    pub(crate) fn new(value: Bytes, expiration: Option<Instant>) -> Self {
         Self { value, expiration }
     }
 
@@ -28,7 +32,9 @@ impl Value {
         }
     }
 
-    pub(crate) fn get_value(&self) -> String {
-        self.value.clone()
+    pub(crate) fn get_value(&self) -> Bytes {
+        self.value.slice(..)
     }
 }
+
+pub(crate) type ExpiryEvent = (Instant, RedisKey);

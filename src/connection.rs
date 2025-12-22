@@ -1,16 +1,18 @@
+use anyhow::Result;
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::mpsc::Sender};
 use tokio_util::codec::Framed;
 
 use crate::{
-    resp::{codec::RespFrame, RespValue},
-    server::types::Value,
+    command::RedisCommand,
+    resp::{codec::RespFrame, RedisValue},
+    server::types::{ExpiryEvent, RedisKey, Value},
 };
 
 /// A type representing an active client connection
@@ -22,21 +24,26 @@ pub(crate) struct RedisConnection {
     frame: Framed<TcpStream, RespFrame>,
 
     /// Reference to the global key / value store
-    db: Arc<RwLock<HashMap<String, Value>>>,
+    db: Arc<DashMap<RedisKey, Value>>,
     // big question here is would it be better to have this serialized through channels? i.e. have
     // a single channel I ask for a key for...? we'll see
+    //
+    /// Place to send newly set keys
+    expiration_tx: Sender<ExpiryEvent>,
 }
 
 impl RedisConnection {
     pub(crate) fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
-        db: Arc<RwLock<HashMap<String, Value>>>,
+        db: Arc<DashMap<RedisKey, Value>>,
+        expiration_tx: Sender<ExpiryEvent>,
     ) -> Self {
         Self {
             client_addr,
             frame: Framed::new(stream, RespFrame),
             db,
+            expiration_tx,
         }
     }
 
@@ -44,149 +51,69 @@ impl RedisConnection {
         while let Some(result) = self.frame.next().await {
             match result {
                 Ok(message) => {
-                    println!("Received RESP value: {message:?}");
-                    self.handle_message(message).await;
+                    tracing::info!("Received RESP value: {message:?}");
+                    let cmd = match RedisCommand::parse(message) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("Error while parsing command: {e:?}");
+                            self.send_error(e).await;
+                            continue;
+                        }
+                    };
+
+                    let response = match self.handle_cmd(cmd).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("Error handling command: {e:?}");
+                            self.send_error(e).await;
+                            continue;
+                        }
+                    };
+
+                    let _ = self.frame.send(response).await;
                 }
                 Err(e) => {
-                    println!("Received error while decoding message: {e:?}");
-                    break;
+                    tracing::error!("Received error while decoding message: {e:?}");
+                    self.send_error(e).await;
+                    continue;
                 }
             }
         }
     }
 
-    async fn handle_message(&mut self, message: RespValue) {
-        let RespValue::Array(array) = message else {
-            println!("Invalid message from client: {message:?}");
-            return;
-        };
-
-        let Some(RespValue::BulkString(cmd)) = array.first() else {
-            println!("Invalid initial type in array: {array:?}");
-            return;
-        };
-
-        self.handle_cmd(cmd.to_ascii_uppercase(), &array[1..]).await
+    async fn send_error(&mut self, e: anyhow::Error) {
+        let _ = self
+            .frame
+            .send(RedisValue::SimpleError(format!("{e:?}").into()))
+            .await;
     }
 
-    async fn handle_cmd(&mut self, cmd: String, args: &[RespValue]) {
-        match cmd.as_str() {
-            "PING" => {
-                // respond to ping with simple string pong
-                let _ = self
-                    .frame
-                    .send(RespValue::SimpleString("PONG".to_string()))
-                    .await;
-            }
-            "ECHO" => {
-                // respond to echo with the string sent by the client
-                if args.is_empty() {
-                    println!("No args for ECHO command!");
-                    return;
+    async fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<RedisValue> {
+        match cmd {
+            RedisCommand::Ping => Ok(RedisValue::SimpleString("PONG".into())),
+            RedisCommand::Echo(msg) => Ok(RedisValue::BulkString(msg)),
+            RedisCommand::Get(key) => match self.db.get(&key) {
+                Some(v) if !v.expired(Instant::now()) => {
+                    tracing::info!("Returning value: {:?}", v.get_value());
+                    Ok(RedisValue::BulkString(v.get_value()))
                 }
-                let _ = self.frame.send(args[0].clone()).await;
-            }
-            "SET" => {
-                if args.len() < 2 {
-                    println!("Invalid number of args for SET command: {args:?}");
-                    return;
-                }
-                let RespValue::BulkString(key) = &args[0] else {
-                    println!("Invalid RESP type for SET command key: {:?}", args[0]);
-                    return;
-                };
-                let RespValue::BulkString(value) = &args[1] else {
-                    println!("Invalid RESP type for SET command value: {:?}", args[1]);
-                    return;
-                };
+                _ => Ok(RedisValue::NullBulkString),
+            },
+            RedisCommand::Set {
+                key,
+                value,
+                expiration,
+            } => {
+                let exp = expiration.map(|dur| Instant::now() + dur);
+                tracing::info!("Set {:?} -> {:?} with expiration at: {exp:?}", key, value);
 
-                // TODO: this is where we'd likely need to implement a parser for this specific
-                // command as well, but for now we'll do it the bad way
-                let expiration = if args.len() == 4 {
-                    let RespValue::BulkString(expiry) = &args[2] else {
-                        println!(
-                            "Invalid RESP type for SET command (expiration): {:?}",
-                            args[2]
-                        );
-                        return;
-                    };
-                    let RespValue::BulkString(duration) = &args[3] else {
-                        println!(
-                            "Invalid RESP type for SET command (expiration): {:?}",
-                            args[3]
-                        );
-                        return;
-                    };
-                    let Ok(time) = duration.parse() else {
-                        println!("Invalid number for duration time: {duration}");
-                        return;
-                    };
-                    Some(match expiry.to_ascii_uppercase().as_str() {
-                        "PX" => Instant::now() + Duration::from_millis(time),
-                        "EX" => Instant::now() + Duration::from_secs(time),
-                        _ => {
-                            println!("Invalid key expiration argument: {expiry}");
-                            return;
-                        }
-                    })
-                } else {
-                    None
+                let val = Value::new(value, exp);
+                self.db.insert(key.slice(..), val);
+                // send our new expiration time to the channel if needed
+                if let Some(time) = exp {
+                    let _ = self.expiration_tx.send((time, key)).await;
                 };
-
-                {
-                    let Ok(mut db) = self.db.write() else {
-                        println!("DB lock poisoned!");
-                        return;
-                    };
-                    // NOTE: for now, we overwrite no matter what! so use insert. entry API could be
-                    // used if we have to start making decisions on whether or not we change up the
-                    // insertion
-                    let _ = db.insert(key.to_string(), Value::new(value.to_string(), expiration));
-                }
-
-                // reply with simple OK
-                let _ = self
-                    .frame
-                    .send(RespValue::SimpleString("OK".to_string()))
-                    .await;
-            }
-            "GET" => {
-                if args.is_empty() {
-                    println!("No args for GET command: {args:?}");
-                    return;
-                }
-                let RespValue::BulkString(key) = &args[0] else {
-                    println!("Invalid RESP type for GET command key: {:?}", args[0]);
-                    return;
-                };
-
-                let reply = {
-                    let Ok(db) = self.db.read() else {
-                        println!("DB lock poisoned");
-                        return;
-                    };
-                    match db.get(key) {
-                        Some(v) => {
-                            // TODO: we either need to grab a write handle to the DB or have a
-                            // background task that will expire keys for us
-                            if v.expired(Instant::now()) {
-                                RespValue::NullBulkString
-                            } else {
-                                RespValue::BulkString(v.get_value())
-                            }
-                        }
-                        None => RespValue::NullBulkString,
-                    }
-                };
-
-                let _ = self.frame.send(reply).await;
-            }
-            _ => {
-                println!("Unsupported command: {cmd:?}");
-                let _ = self
-                    .frame
-                    .send(RespValue::SimpleError("Unsupported command".to_string()))
-                    .await;
+                Ok(RedisValue::SimpleString("OK".into()))
             }
         }
     }

@@ -1,258 +1,314 @@
-use crate::resp::RespValue;
+use bytes::{Bytes, BytesMut};
+
+use crate::resp::RedisValue;
 
 use std::{num::ParseIntError, str::Utf8Error};
 
-use nom::{
-    branch::alt,
-    bytes::streaming::{tag, take, take_until},
-    character::streaming::crlf,
-    combinator::map_res,
-    error::{ErrorKind, FromExternalError, ParseError},
-    multi::many_m_n,
-    sequence::terminated,
-    IResult, Parser,
-};
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum RespParseError<I> {
+#[derive(Debug)]
+pub enum RespParseError {
+    IOError(std::io::Error),
     ParseUtf8Error(Utf8Error),
     ParseIntegerError(ParseIntError),
-    NomErr(I, ErrorKind),
+    InvalidFirstByte,
+    InvalidBulkStringLength(i64),
+    ExceededMaxLength,
+    InvalidArrayLength(i64),
 }
 
-impl<I> ParseError<I> for RespParseError<I> {
-    fn from_error_kind(input: I, kind: ErrorKind) -> Self {
-        RespParseError::NomErr(input, kind)
-    }
-
-    fn append(_input: I, _kind: ErrorKind, other: Self) -> Self {
-        other
-    }
-}
-
-impl<I, E> FromExternalError<I, E> for RespParseError<I>
-where
-    E: Into<RespParseError<I>>,
-{
-    fn from_external_error(_input: I, _kind: ErrorKind, e: E) -> Self {
-        e.into()
+impl From<std::io::Error> for RespParseError {
+    fn from(value: std::io::Error) -> Self {
+        Self::IOError(value)
     }
 }
 
-impl<I> From<Utf8Error> for RespParseError<I> {
-    fn from(value: Utf8Error) -> Self {
-        RespParseError::ParseUtf8Error(value)
-    }
-}
-
-impl<I> From<ParseIntError> for RespParseError<I> {
+impl From<ParseIntError> for RespParseError {
     fn from(value: ParseIntError) -> Self {
-        RespParseError::ParseIntegerError(value)
+        Self::ParseIntegerError(value)
     }
 }
 
-type RespParseResult<I, O, E = RespParseError<I>> = IResult<I, O, E>;
+impl From<Utf8Error> for RespParseError {
+    fn from(value: Utf8Error) -> Self {
+        Self::ParseUtf8Error(value)
+    }
+}
 
-fn parse_simple(input: &[u8]) -> RespParseResult<&[u8], RespValue> {
-    let tpl = (
-        alt((tag(&b"+"[..]), tag(&b"-"[..]))),
-        take_until("\r\n"),
-        crlf,
-    );
-    map_res(tpl, |parsed: (&[u8], &[u8], &[u8])| {
-        // save ourselves the heap allocation until we know that this is valid utf-8
-        let s = str::from_utf8(parsed.1)?;
-        if parsed.0 == &b"+"[..] {
-            Ok::<RespValue, RespParseError<&[u8]>>(RespValue::SimpleString(s.to_string()))
+#[derive(Debug, PartialEq)]
+pub(crate) struct BufRange(usize, usize);
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RedisIntermediate {
+    SimpleString(BufRange),
+    SimpleError(BufRange),
+    Integer(i64),
+    NullBulkString,
+    BulkString(BufRange),
+    NullArray,
+    Array(Vec<RedisIntermediate>),
+}
+
+impl RedisIntermediate {
+    pub(crate) fn generate_value(self, buffer: &Bytes) -> RedisValue {
+        match self {
+            Self::SimpleString(br) => RedisValue::SimpleString(buffer.slice(br.0..br.1)),
+            Self::SimpleError(br) => RedisValue::SimpleError(buffer.slice(br.0..br.1)),
+            Self::Integer(i) => RedisValue::Integer(i),
+            Self::NullBulkString => RedisValue::NullBulkString,
+            Self::BulkString(br) => RedisValue::BulkString(buffer.slice(br.0..br.1)),
+            Self::NullArray => RedisValue::NullArray,
+            Self::Array(intermediates) => RedisValue::Array(
+                intermediates
+                    .into_iter()
+                    .map(|int| int.generate_value(buffer))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+type ParseResult = Result<Option<(usize, RedisIntermediate)>, RespParseError>;
+
+fn parse_word(input: &BytesMut, pos: usize) -> Option<(usize, BufRange)> {
+    if input.len() <= pos {
+        return None;
+    }
+    memchr::memchr(b'\r', &input[pos..]).and_then(|ret| {
+        if ret + 1 < input.len() && input[pos + ret + 1] == b'\n' {
+            Some((pos + ret + 2, BufRange(pos, pos + ret)))
         } else {
-            Ok(RespValue::SimpleError(s.to_string()))
+            None
         }
     })
-    .parse(input)
 }
 
-fn int_word(input: &[u8]) -> RespParseResult<&[u8], i64> {
-    map_res((take_until("\r\n"), crlf), |parsed: (&[u8], &[u8])| {
-        let num_str = str::from_utf8(parsed.0)?;
-        Ok::<i64, RespParseError<&[u8]>>(num_str.parse()?)
-    })
-    .parse(input)
+fn parse_simple_string(input: &BytesMut, pos: usize) -> ParseResult {
+    Ok(parse_word(input, pos).map(|(p, split)| (p, RedisIntermediate::SimpleString(split))))
 }
 
-fn parse_integer(input: &[u8]) -> RespParseResult<&[u8], RespValue> {
-    let tpl = (tag(&b":"[..]), int_word);
-    map_res(tpl, |parsed: (&[u8], i64)| {
-        Ok::<RespValue, RespParseError<&[u8]>>(RespValue::Integer(parsed.1))
-    })
-    .parse(input)
+fn parse_simple_error(input: &BytesMut, pos: usize) -> ParseResult {
+    Ok(parse_word(input, pos).map(|(p, split)| (p, RedisIntermediate::SimpleError(split))))
 }
 
-fn parse_bulk_string(input: &[u8]) -> RespParseResult<&[u8], RespValue> {
-    let (input, (_, s_len)) = (tag(&b"$"[..]), int_word).parse(input)?;
+fn int(input: &BytesMut, pos: usize) -> Result<Option<(usize, i64)>, RespParseError> {
+    match parse_word(input, pos) {
+        Some((p, int_range)) => {
+            let s = str::from_utf8(&input[int_range.0..int_range.1])?;
+            Ok(Some((p, s.parse()?)))
+        }
+        None => Ok(None),
+    }
+}
 
-    // check for Null string
-    if s_len < 0 {
-        return Ok((input, RespValue::NullBulkString));
+fn parse_integer(input: &BytesMut, pos: usize) -> ParseResult {
+    Ok(int(input, pos)?.map(|(p, int)| (p, RedisIntermediate::Integer(int))))
+}
+
+fn parse_bulk_string(input: &BytesMut, pos: usize) -> ParseResult {
+    match int(input, pos)? {
+        Some((p, -1)) => Ok(Some((p, RedisIntermediate::NullBulkString))),
+        Some((p, length)) if length >= 0 => {
+            if length > u32::MAX as i64 {
+                return Err(RespParseError::ExceededMaxLength);
+            }
+            let end = p + length as usize;
+            if input.len() < end + 2 {
+                Ok(None)
+            } else {
+                Ok(Some((
+                    end + 2,
+                    RedisIntermediate::BulkString(BufRange(p, end)),
+                )))
+            }
+        }
+        Some((_p, invalid_length)) => Err(RespParseError::InvalidBulkStringLength(invalid_length)),
+        None => Ok(None),
+    }
+}
+
+fn parse_array(input: &BytesMut, pos: usize) -> ParseResult {
+    match int(input, pos)? {
+        Some((p, -1)) => Ok(Some((p, RedisIntermediate::NullArray))),
+        Some((mut p, length)) if length >= 0 => {
+            if length > u32::MAX as i64 {
+                return Err(RespParseError::ExceededMaxLength);
+            }
+            let mut values = Vec::with_capacity(length as usize);
+            for _ in 0..length {
+                match parse(input, p)? {
+                    Some((new_p, v)) => {
+                        p = new_p;
+                        values.push(v);
+                    }
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some((p, RedisIntermediate::Array(values))))
+        }
+        Some((_p, invalid_length)) => Err(RespParseError::InvalidArrayLength(invalid_length)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn parse(input: &BytesMut, pos: usize) -> ParseResult {
+    if input.is_empty() {
+        return Ok(None);
     }
 
-    // now we can take as many bytes as needed based on s_len
-    map_res(terminated(take(s_len as usize), crlf), |parsed| {
-        let s = str::from_utf8(parsed)?;
-        Ok::<RespValue, RespParseError<&[u8]>>(RespValue::BulkString(s.to_string()))
-    })
-    .parse(input)
-}
-
-fn parse_array(input: &[u8]) -> RespParseResult<&[u8], RespValue> {
-    // first grab the number of elements information (don't forget null arrays!)
-    let (input, (_, a_len)) = (tag(&b"*"[..]), int_word).parse(input)?;
-
-    // check for Null array
-    if a_len < 0 {
-        return Ok((input, RespValue::NullArray));
+    if input.len() <= pos {
+        return Ok(None);
     }
 
-    // now we parse as many RespValue's as we can and try to collect them into a Vec of RespValues
-    map_res(
-        many_m_n(a_len as usize, a_len as usize, parse_resp),
-        |parsed: Vec<RespValue>| Ok::<RespValue, RespParseError<&[u8]>>(RespValue::Array(parsed)),
-    )
-    .parse(input)
-}
-
-pub(crate) fn parse_resp(input: &[u8]) -> RespParseResult<&[u8], RespValue> {
-    let mut p = alt([parse_simple, parse_integer, parse_bulk_string, parse_array]);
-    p.parse(input)
+    match input[pos] {
+        b'+' => parse_simple_string(input, pos + 1),
+        b'-' => parse_simple_error(input, pos + 1),
+        b':' => parse_integer(input, pos + 1),
+        b'$' => parse_bulk_string(input, pos + 1),
+        b'*' => parse_array(input, pos + 1),
+        _ => Err(RespParseError::InvalidFirstByte),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
-
     use super::*;
+
+    fn setup_parse(input: &[u8]) -> RedisValue {
+        let mut buf = BytesMut::from(input);
+        let (pos, intermediate) = parse(&buf, 0).unwrap().unwrap();
+        let parsed = buf.split_to(pos);
+        intermediate.generate_value(&parsed.freeze())
+    }
+
+    fn setup_result(input: &[u8]) -> ParseResult {
+        let buf = BytesMut::from(input);
+        parse(&buf, 0)
+    }
+
+    #[test]
+    fn test_parse() {
+        let mut buf = BytesMut::from("$5\r\nhello\r\n");
+        let (pos, v) = parse(&buf, 0).unwrap().unwrap();
+        assert_eq!(pos, 11);
+        assert_eq!(v, RedisIntermediate::BulkString(BufRange(4, 9)));
+        // how we would use it in the decoder is below
+        let parsed = buf.split_to(pos);
+        let value = v.generate_value(&parsed.freeze());
+        assert_eq!(value, RedisValue::BulkString(Bytes::from("hello")));
+    }
+
+    #[test]
+    fn test_word() {
+        let buf = BytesMut::from("32\r\n");
+        assert_eq!(parse_word(&buf, 0), Some((4, BufRange(0, 2))));
+        let buf = BytesMut::from("string\r\n");
+        assert_eq!(parse_word(&buf, 0), Some((8, BufRange(0, 6))));
+        let buf = BytesMut::from("32\r");
+        assert!(parse_word(&buf, 0).is_none());
+    }
 
     #[test]
     fn test_simple_string_error_succ() {
-        let (_remain, parsed) = parse_resp(&b"+OK\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::SimpleString("OK".to_string()));
-        let (_remain, parsed) = parse_resp(&b"-Error message\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::SimpleError("Error message".to_string()));
+        let parsed = setup_parse(&b"+OK\r\n"[..]);
+        assert_eq!(parsed, RedisValue::SimpleString("OK".into()));
+        let parsed = setup_parse(&b"-Error message\r\n"[..]);
+        assert_eq!(parsed, RedisValue::SimpleError("Error message".into()));
     }
 
     #[test]
     fn test_simple_string_error_fail() {
-        let res = parse_resp(&b"+OK"[..]);
-        assert_eq!(res, Err(nom::Err::Incomplete(nom::Needed::Unknown)));
-        let res = parse_resp(&b"-Error"[..]);
-        assert_eq!(res, Err(nom::Err::Incomplete(nom::Needed::Unknown)));
-        let non_utf8_bytes: Vec<u8> = vec![b'+', 0xa9, 0xfe, 0xff, b'\r', b'\n'];
-        let res = parse_resp(&non_utf8_bytes);
-        assert!(res.is_err());
+        let res = setup_result(&b"+OK"[..]).unwrap();
+        assert!(res.is_none());
+        let res = setup_result(&b"-Error"[..]).unwrap();
+        assert!(res.is_none());
     }
 
     #[test]
     fn test_integer_succ() {
-        let (_, parsed) = parse_resp(&b":0\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::Integer(0));
-        let (_, parsed) = parse_resp(&b":100\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::Integer(100));
-        let (_, parsed) = parse_resp(&b":-100\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::Integer(-100));
+        let parsed = setup_parse(&b":0\r\n"[..]);
+        assert_eq!(parsed, RedisValue::Integer(0));
+        let parsed = setup_parse(&b":100\r\n"[..]);
+        assert_eq!(parsed, RedisValue::Integer(100));
+        let parsed = setup_parse(&b":-100\r\n"[..]);
+        assert_eq!(parsed, RedisValue::Integer(-100));
     }
 
     #[test]
     fn test_integer_fail() {
-        let res = parse_resp(&b":1a0\r\n"[..]);
+        let res = setup_result(&b":1a0\r\n"[..]);
         assert!(res.is_err());
     }
 
     #[test]
     fn test_bulk_string_succ() {
-        let (_, parsed) = parse_resp(&b"$-1\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::NullBulkString);
-        let (_, parsed) = parse_resp(&b"$5\r\nhello\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::BulkString("hello".to_string()));
-        let (_, parsed) = parse_resp(&b"$0\r\n\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::BulkString("".to_string()));
+        let parsed = setup_parse(&b"$-1\r\n"[..]);
+        assert_eq!(parsed, RedisValue::NullBulkString);
+        let parsed = setup_parse(&b"$5\r\nhello\r\n"[..]);
+        assert_eq!(parsed, RedisValue::BulkString("hello".into()));
+        let parsed = setup_parse(&b"$0\r\n\r\n"[..]);
+        assert_eq!(parsed, RedisValue::BulkString("".into()));
     }
 
     #[test]
     fn test_bulk_string_fail() {
-        let res = parse_resp(&b"$a\r\nhellohello\r\n"[..]);
+        let res = setup_result(&b"$a\r\nhellohello\r\n"[..]);
         assert!(res.is_err());
-        let res = parse_resp(&b"$10\r\nhello\r\n"[..]);
-        // NOTE: The size is really 5, but the \r\n is counted greedily until it's needed to fully
-        // complete the value; see example below where 2 bytes are still needed. this says we need
-        // 3 total bytes to go, but we really need 3 + 2 for the \r\n. if we fully parse the length
-        //   of the string, we will still need the final 2 for \r\n
-        assert_eq!(
-            res,
-            Err(nom::Err::Incomplete(nom::Needed::Size(
-                NonZero::new(3).unwrap()
-            )))
-        );
-        let res = parse_resp(&b"$10\r\nhello678\r\n"[..]);
-        assert_eq!(
-            res,
-            Err(nom::Err::Incomplete(nom::Needed::Size(
-                NonZero::new(2).unwrap()
-            )))
-        );
+        let res = setup_result(&b"$10\r\nhello\r\n"[..]).unwrap();
+        assert!(res.is_none());
+        let res = setup_result(&b"$10\r\nhello678\r\n"[..]).unwrap();
+        assert!(res.is_none());
     }
 
     #[test]
     fn test_array_succ() {
-        let (_, parsed) = parse_resp(&b"*-1\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::NullArray);
-        let (_, parsed) = parse_resp(&b"*0\r\n"[..]).unwrap();
-        assert_eq!(parsed, RespValue::Array(vec![]));
-        let (_, parsed) = parse_resp(&b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n"[..]).unwrap();
+        let parsed = setup_parse(&b"*-1\r\n"[..]);
+        assert_eq!(parsed, RedisValue::NullArray);
+        let parsed = setup_parse(&b"*0\r\n"[..]);
+        assert_eq!(parsed, RedisValue::Array(vec![]));
+        let parsed = setup_parse(&b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n"[..]);
         assert_eq!(
             parsed,
-            RespValue::Array(vec![
-                RespValue::BulkString("hello".to_string()),
-                RespValue::BulkString("world".to_string())
+            RedisValue::Array(vec![
+                RedisValue::BulkString("hello".into()),
+                RedisValue::BulkString("world".into())
             ])
         );
-        let (_, parsed) = parse_resp(&b"*3\r\n:1\r\n:2\r\n:3\r\n"[..]).unwrap();
+        let parsed = setup_parse(&b"*3\r\n:1\r\n:2\r\n:3\r\n"[..]);
         assert_eq!(
             parsed,
-            RespValue::Array(vec![
-                RespValue::Integer(1),
-                RespValue::Integer(2),
-                RespValue::Integer(3)
+            RedisValue::Array(vec![
+                RedisValue::Integer(1),
+                RedisValue::Integer(2),
+                RedisValue::Integer(3)
             ])
         );
     }
 
     #[test]
     fn complex_arrays() {
-        let (_, parsed) =
-            parse_resp(&b"*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$5\r\nhello\r\n"[..]).unwrap();
+        let parsed = setup_parse(&b"*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$5\r\nhello\r\n"[..]);
         assert_eq!(
             parsed,
-            RespValue::Array(vec![
-                RespValue::Integer(1),
-                RespValue::Integer(2),
-                RespValue::Integer(3),
-                RespValue::Integer(4),
-                RespValue::BulkString("hello".to_string()),
+            RedisValue::Array(vec![
+                RedisValue::Integer(1),
+                RedisValue::Integer(2),
+                RedisValue::Integer(3),
+                RedisValue::Integer(4),
+                RedisValue::BulkString("hello".into()),
             ])
         );
 
-        let (_, parsed) =
-            parse_resp(&b"*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n-World\r\n"[..]).unwrap();
+        let parsed = setup_parse(&b"*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n-World\r\n"[..]);
         assert_eq!(
             parsed,
-            RespValue::Array(vec![
-                RespValue::Array(vec![
-                    RespValue::Integer(1),
-                    RespValue::Integer(2),
-                    RespValue::Integer(3),
+            RedisValue::Array(vec![
+                RedisValue::Array(vec![
+                    RedisValue::Integer(1),
+                    RedisValue::Integer(2),
+                    RedisValue::Integer(3),
                 ]),
-                RespValue::Array(vec![
-                    RespValue::SimpleString("Hello".to_string()),
-                    RespValue::SimpleError("World".to_string()),
+                RedisValue::Array(vec![
+                    RedisValue::SimpleString("Hello".into()),
+                    RedisValue::SimpleError("World".into()),
                 ]),
             ])
         );
@@ -260,30 +316,25 @@ mod tests {
 
     #[test]
     fn test_array_fail() {
-        // will still need 1 RespValue for this array (the size needed is from the many_m_n
-        // combinator)
-        let res = parse_resp(&b"*2\r\n:1\r\n"[..]);
-        assert_eq!(
-            res,
-            Err(nom::Err::Incomplete(nom::Needed::Size(
-                NonZero::new(1).unwrap()
-            )))
-        );
-        assert_eq!(
-            res,
-            Err(nom::Err::Incomplete(nom::Needed::Size(
-                NonZero::new(1).unwrap()
-            )))
-        );
+        let res = setup_result(&b"*2\r\n:1\r\n"[..]).unwrap();
+        assert!(res.is_none());
     }
 
     #[test]
     fn test_multiple_parse() {
-        let input = b"+OK\r\n:100\r\n";
-        let (remain, parsed) = parse_resp(&input[..]).unwrap();
-        assert_eq!(parsed, RespValue::SimpleString("OK".to_string()));
-        let (remain, parsed) = parse_resp(remain).unwrap();
-        assert_eq!(parsed, RespValue::Integer(100));
-        assert!(remain.is_empty());
+        let mut input = BytesMut::from(&b"+OK\r\n:100\r\n"[..]);
+        let (pos, intermediate) = parse(&input, 0).unwrap().unwrap();
+        let parsed = input.split_to(pos);
+        assert_eq!(
+            intermediate.generate_value(&parsed.freeze()),
+            RedisValue::SimpleString("OK".into())
+        );
+        // parse the input again from index 0
+        let (pos, intermediate) = parse(&input, 0).unwrap().unwrap();
+        let parsed = input.split_to(pos);
+        assert_eq!(
+            intermediate.generate_value(&parsed.freeze()),
+            RedisValue::Integer(100)
+        );
     }
 }

@@ -1,13 +1,15 @@
+use bytes::Bytes;
+
 pub mod codec;
 mod parse;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum RespValue {
-    SimpleString(String),
-    SimpleError(String),
+#[derive(Debug, PartialEq, Clone)]
+pub enum RedisValue {
+    SimpleString(Bytes),
+    SimpleError(Bytes),
     Integer(i64),
-    BulkString(String),
     NullBulkString,
-    Array(Vec<RespValue>),
+    BulkString(Bytes),
     NullArray,
+    Array(Vec<RedisValue>),
 }
