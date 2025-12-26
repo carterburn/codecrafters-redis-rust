@@ -10,19 +10,17 @@ use tokio::{
 
 use crate::{
     connection::RedisConnection,
-    server::types::{ExpiryEvent, RedisKey, Value},
+    server::types::{Database, ExpiryEvent, RedisKey, Value, INITIAL_CAPACITY},
 };
 
 pub(crate) mod types;
-
-const INITIAL_CAPACITY: usize = 16;
 
 pub struct Redis {
     /// TCP Listener on given port
     listener: TcpListener,
     // Clients connected -> should be join handles or arc of the clients?
     /// The global key/value store
-    db: Arc<DashMap<RedisKey, Value>>,
+    db: Arc<Database>,
 
     /// The channel to send expiration events on
     expiration_tx: Sender<ExpiryEvent>,
@@ -30,7 +28,7 @@ pub struct Redis {
 
 impl Redis {
     pub async fn new(port: u16) -> Result<Self> {
-        let db = Arc::new(DashMap::with_capacity(INITIAL_CAPACITY));
+        let db = Arc::new(Database::new());
 
         // create task to expire keys
         let (tx, rx) = tokio::sync::mpsc::channel::<ExpiryEvent>(INITIAL_CAPACITY);
@@ -60,7 +58,7 @@ impl Redis {
         Ok(())
     }
 
-    async fn key_expirer(db: Arc<DashMap<RedisKey, Value>>, mut expiry_rx: Receiver<ExpiryEvent>) {
+    async fn key_expirer(db: Arc<Database>, mut expiry_rx: Receiver<ExpiryEvent>) {
         // binary min-heap to provide O(1) selection of next key to grab
         let mut expiry_queue: BinaryHeap<Reverse<(Instant, RedisKey)>> =
             BinaryHeap::with_capacity(INITIAL_CAPACITY);
@@ -72,18 +70,11 @@ impl Redis {
             tokio::select! {
                 Some(event) = expiry_rx.recv() => {
                     tracing::info!("Received new expiration event: {event:?}");
-                    // we should clear out any instances of event.1 (the key) in the queue, then
-                    // add a new one so we don't have a weird instance of expiring a key early from
-                    // a previous set wait event
-                    // Ex: if we SET foo bar EX 10 and wait 5.1 seconds then SET foo bar EX 5, it
-                    // should expire 5 seconds after the last SET, not with the SET foo bar EX 10
-                    // original timeline
-                    expiry_queue.retain(|Reverse(evt)| evt.1 != event.1);
                     expiry_queue.push(Reverse(event));
                 },
                 _ = async {
                     if let Some(time) = next_expiry {
-                        tracing::info!("Watching on a specific key");
+                        tracing::info!("Waiting until next expiration");
                         sleep_until(tokio::time::Instant::from_std(time)).await;
                     } else {
                         tracing::info!("No keys that will expire! Waiting forever");
@@ -92,14 +83,24 @@ impl Redis {
                 } => {
                     let now = Instant::now();
                     while let Some(Reverse(exp_evt)) = expiry_queue.peek() {
-                        if exp_evt.0 > now {
+                        let expire_time = exp_evt.0;
+                        if expire_time > now {
                             // done, we've processed all events
                             break;
                         }
-                        // we know it is expired now, so remove the key
+                        // we know it is expired now, so remove the key if this event is one that
+                        // matches the true value in the db
                         let key = expiry_queue.pop().unwrap().0.1;
-                        db.remove(&key);
-                        tracing::info!("Expired key: {key:?}");
+                        let Some(true_exp) = db.get_key_expiration(&key) else {
+                            continue;
+                        };
+                        if expire_time == true_exp {
+                            // now we actually remove from the db, this is a real event
+                            db.remove_key(&key);
+                            tracing::info!("Expired key: {key:?}");
+                        } else {
+                            tracing::info!("Skipping key with stale expiration");
+                        }
                     }
                 }
             }

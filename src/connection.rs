@@ -12,7 +12,7 @@ use tokio_util::codec::Framed;
 use crate::{
     command::RedisCommand,
     resp::{codec::RespFrame, RedisValue},
-    server::types::{ExpiryEvent, RedisKey, Value},
+    server::types::{Database, ExpiryEvent, RedisKey, Value},
 };
 
 /// A type representing an active client connection
@@ -24,7 +24,7 @@ pub(crate) struct RedisConnection {
     frame: Framed<TcpStream, RespFrame>,
 
     /// Reference to the global key / value store
-    db: Arc<DashMap<RedisKey, Value>>,
+    db: Arc<Database>,
     // big question here is would it be better to have this serialized through channels? i.e. have
     // a single channel I ask for a key for...? we'll see
     //
@@ -36,7 +36,7 @@ impl RedisConnection {
     pub(crate) fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
-        db: Arc<DashMap<RedisKey, Value>>,
+        db: Arc<Database>,
         expiration_tx: Sender<ExpiryEvent>,
     ) -> Self {
         Self {
@@ -92,10 +92,10 @@ impl RedisConnection {
         match cmd {
             RedisCommand::Ping => Ok(RedisValue::SimpleString("PONG".into())),
             RedisCommand::Echo(msg) => Ok(RedisValue::BulkString(msg)),
-            RedisCommand::Get(key) => match self.db.get(&key) {
-                Some(v) if !v.expired(Instant::now()) => {
-                    tracing::info!("Returning value: {:?}", v.get_value());
-                    Ok(RedisValue::BulkString(v.get_value()))
+            RedisCommand::Get(key) => match self.db.get_key(&key) {
+                Some(v) => {
+                    tracing::info!("Returning value: {:?}", v);
+                    Ok(RedisValue::BulkString(v))
                 }
                 _ => Ok(RedisValue::NullBulkString),
             },
@@ -108,12 +108,23 @@ impl RedisConnection {
                 tracing::info!("Set {:?} -> {:?} with expiration at: {exp:?}", key, value);
 
                 let val = Value::new(value, exp);
-                self.db.insert(key.slice(..), val);
+                self.db.set_key(&key, val);
                 // send our new expiration time to the channel if needed
                 if let Some(time) = exp {
                     let _ = self.expiration_tx.send((time, key)).await;
                 };
                 Ok(RedisValue::SimpleString("OK".into()))
+            }
+            RedisCommand::RPush {
+                list_name,
+                elements,
+            } => {
+                tracing::info!("RPush to {list_name:?} with elements: {elements:?}");
+                let size = self.db.rpush(
+                    &list_name,
+                    elements.iter().map(|e| Value::new(e.clone(), None)),
+                );
+                Ok(RedisValue::Integer(size as i64))
             }
         }
     }

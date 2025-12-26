@@ -15,6 +15,10 @@ pub(crate) enum RedisCommand {
         value: Bytes,
         expiration: Option<Duration>,
     },
+    RPush {
+        list_name: Bytes,
+        elements: Vec<Bytes>,
+    },
 }
 
 impl RedisCommand {
@@ -52,29 +56,44 @@ impl RedisCommand {
                 let key = Self::expect_bulk_string(&values, 1)?;
                 let value = Self::expect_bulk_string(&values, 2)?;
 
-                // optional expiration
-                let expiration = if values.len() >= 5 {
-                    // SET key value [PX|EX] <duration>
-                    let exp_type = Self::expect_bulk_string(&values, 3)?;
-                    let exp_dur = Self::expect_bulk_string(&values, 4)?;
+                let mut expiration = None;
 
-                    let dur: u64 = str::from_utf8(&exp_dur[..])?.parse()?;
-                    let ex_type = str::from_utf8(&exp_type[..])?;
-                    match ex_type.to_uppercase().as_str() {
-                        "PX" => Some(Duration::from_millis(dur)),
-                        "EX" => Some(Duration::from_secs(dur)),
+                let mut rest = values[3..].iter();
+                while let Some(v) = rest.next() {
+                    let arg: String = v.try_into()?;
+                    match arg.as_str() {
+                        "PX" => {
+                            let dur = rest.next().ok_or(anyhow::anyhow!(
+                                "Not enough args, expected duration specifier"
+                            ))?;
+                            expiration = Some(process_time(dur, Duration::from_millis)?);
+                        }
+                        "EX" => {
+                            let dur = rest.next().ok_or(anyhow::anyhow!(
+                                "Not enough args, expected duration specifier"
+                            ))?;
+                            expiration = Some(process_time(dur, Duration::from_secs)?);
+                        }
                         _ => {
-                            return Err(anyhow::anyhow!("Invalid expiration type: {ex_type}"));
+                            return Err(anyhow::anyhow!("Unsupported or invalid argument: {arg}"));
                         }
                     }
-                } else {
-                    None
-                };
+                }
 
                 Ok(Self::Set {
                     key,
                     value,
                     expiration,
+                })
+            }
+            "RPUSH" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                // collect remaining values as Bytes values
+                let elements: Result<Vec<Bytes>, anyhow::Error> =
+                    values[2..].iter().map(|rv| rv.try_into()).collect();
+                Ok(Self::RPush {
+                    list_name,
+                    elements: elements?,
                 })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
@@ -92,4 +111,13 @@ impl RedisCommand {
                 "Expected bulk string at index {index} of {values:?}"
             ))
     }
+}
+
+fn process_time<F>(dur: &RedisValue, f: F) -> Result<Duration>
+where
+    F: Fn(u64) -> Duration,
+{
+    let dur_str: String = dur.try_into()?;
+    let dur: u64 = dur_str.parse()?;
+    Ok(f(dur))
 }
