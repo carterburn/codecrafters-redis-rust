@@ -19,6 +19,11 @@ pub(crate) enum RedisCommand {
         list_name: Bytes,
         elements: Vec<Bytes>,
     },
+    LRange {
+        list_name: Bytes,
+        start: usize,
+        end: usize,
+    },
 }
 
 impl RedisCommand {
@@ -94,6 +99,22 @@ impl RedisCommand {
                 Ok(Self::RPush {
                     list_name,
                     elements: elements?,
+                })
+            }
+            "LRANGE" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                // expect two more bulk strings, otherwise, it is an error
+                let start = Self::expect_bulk_string(&values, 2)?;
+                let end = Self::expect_bulk_string(&values, 3)?;
+                let start = str::from_utf8(&start)?;
+                let end = str::from_utf8(&end)?;
+                let start: usize = start.parse()?;
+                let end: usize = end.parse()?;
+
+                Ok(Self::LRange {
+                    list_name,
+                    start,
+                    end,
                 })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),

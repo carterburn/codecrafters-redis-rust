@@ -5,6 +5,7 @@ use dashmap::DashMap;
 
 pub(crate) type RedisKey = Bytes;
 
+#[derive(Clone)]
 pub(crate) struct Value {
     /// The actual value
     value: Bytes,
@@ -94,6 +95,27 @@ impl Database {
             .or_insert(Vec::with_capacity(INITIAL_CAPACITY));
         list.extend(value);
         list.len()
+    }
+
+    pub(crate) fn lrange(
+        &self,
+        key: &RedisKey,
+        start: usize,
+        mut end: usize,
+    ) -> Option<Vec<Value>> {
+        let list = self.lists.get(key)?;
+        if start >= list.len() {
+            return None;
+        }
+        if end >= list.len() {
+            // inclusive ranges so truncate to the last element's index
+            end = list.len() - 1;
+        }
+        if start > end {
+            return None;
+        }
+
+        Some(list[start..=end].iter().map(|v| v.clone()).collect())
     }
 
     pub(crate) fn kv(&self) -> Arc<DashMap<RedisKey, Value>> {

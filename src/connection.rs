@@ -126,6 +126,22 @@ impl RedisConnection {
                 );
                 Ok(RedisValue::Integer(size as i64))
             }
+            RedisCommand::LRange {
+                list_name,
+                start,
+                end,
+            } => {
+                tracing::info!("LRange on {list_name:?} for range: {start}..={end}");
+                if let Some(vals) = self.db.lrange(&list_name, start, end) {
+                    Ok(RedisValue::Array(
+                        vals.iter()
+                            .map(|v| RedisValue::BulkString(v.get_value()))
+                            .collect(),
+                    ))
+                } else {
+                    Ok(RedisValue::NullArray)
+                }
+            }
         }
     }
 }
