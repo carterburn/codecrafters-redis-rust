@@ -139,7 +139,7 @@ impl RedisConnection {
                             .collect(),
                     ))
                 } else {
-                    Ok(RedisValue::NullArray)
+                    Ok(RedisValue::Array(vec![]))
                 }
             }
         }
