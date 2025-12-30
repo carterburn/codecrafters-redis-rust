@@ -19,6 +19,10 @@ pub(crate) enum RedisCommand {
         list_name: Bytes,
         elements: Vec<Bytes>,
     },
+    LPush {
+        list_name: Bytes,
+        elements: Vec<Bytes>,
+    },
     LRange {
         list_name: Bytes,
         start: isize,
@@ -97,6 +101,15 @@ impl RedisCommand {
                 let elements: Result<Vec<Bytes>, anyhow::Error> =
                     values[2..].iter().map(|rv| rv.try_into()).collect();
                 Ok(Self::RPush {
+                    list_name,
+                    elements: elements?,
+                })
+            }
+            "LPUSH" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                let elements: Result<Vec<Bytes>, anyhow::Error> =
+                    values[2..].iter().map(|rv| rv.try_into()).collect();
+                Ok(Self::LPush {
                     list_name,
                     elements: elements?,
                 })

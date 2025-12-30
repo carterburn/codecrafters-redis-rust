@@ -126,6 +126,17 @@ impl RedisConnection {
                 );
                 Ok(RedisValue::Integer(size as i64))
             }
+            RedisCommand::LPush {
+                list_name,
+                elements,
+            } => {
+                tracing::info!("LPush to {list_name:?} with elements: {elements:?}");
+                let size = self.db.lpush(
+                    &list_name,
+                    elements.iter().map(|e| Value::new(e.clone(), None)),
+                );
+                Ok(RedisValue::Integer(size as i64))
+            }
             RedisCommand::LRange {
                 list_name,
                 start,

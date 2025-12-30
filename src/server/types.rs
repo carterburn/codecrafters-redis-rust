@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -52,7 +52,7 @@ pub(crate) struct Database {
     kv: Arc<DashMap<RedisKey, Value>>,
 
     /// List support
-    lists: Arc<DashMap<RedisKey, Vec<Value>>>,
+    lists: Arc<DashMap<RedisKey, VecDeque<Value>>>,
 }
 
 impl Database {
@@ -92,8 +92,19 @@ impl Database {
         let mut list = self
             .lists
             .entry(key.clone())
-            .or_insert(Vec::with_capacity(INITIAL_CAPACITY));
+            .or_insert(VecDeque::with_capacity(INITIAL_CAPACITY));
         list.extend(value);
+        list.len()
+    }
+
+    pub(crate) fn lpush(&self, key: &RedisKey, value: impl Iterator<Item = Value>) -> usize {
+        let mut list = self
+            .lists
+            .entry(key.clone())
+            .or_insert(VecDeque::with_capacity(INITIAL_CAPACITY));
+        for v in value {
+            list.push_front(v);
+        }
         list.len()
     }
 
@@ -124,14 +135,22 @@ impl Database {
             return None;
         }
 
-        Some(list[start..=end].to_vec())
-    }
-
-    pub(crate) fn kv(&self) -> Arc<DashMap<RedisKey, Value>> {
-        self.kv.clone()
-    }
-
-    pub(crate) fn lists(&self) -> Arc<DashMap<RedisKey, Vec<Value>>> {
-        self.lists.clone()
+        let (head, tail) = list.as_slices();
+        Some(if start > head.len() {
+            // all indices are in tail, so just adjust the indices by head.len()
+            tracing::info!("Indices in tail: {start} {end} {}", head.len());
+            tail[start - head.len()..=end - head.len()].to_vec()
+        } else if end > head.len() {
+            tracing::info!("Split indices: {start} {end} {}", head.len());
+            // start starts in head and consumes the rest, then finishes off in tail
+            let mut first = head[start..].to_vec();
+            let second = tail[..end - head.len()].to_vec();
+            first.extend(second);
+            first
+        } else {
+            tracing::info!("Indices in head: {start} {end} {}", head.len());
+            // both start and end exist in head, so can just grip and rip
+            head[start..=end].to_vec()
+        })
     }
 }
