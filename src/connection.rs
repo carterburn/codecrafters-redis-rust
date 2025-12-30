@@ -1,18 +1,14 @@
 use anyhow::Result;
-use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::TcpStream, sync::mpsc::Sender};
 use tokio_util::codec::Framed;
 
 use crate::{
     command::RedisCommand,
     resp::{codec::RespFrame, RedisValue},
-    server::types::{Database, ExpiryEvent, RedisKey, Value},
+    server::database::Database,
+    server::types::{ExpiryEvent, Value},
 };
 
 /// A type representing an active client connection
@@ -124,7 +120,7 @@ impl RedisConnection {
                     &list_name,
                     elements.iter().map(|e| Value::new(e.clone(), None)),
                 );
-                Ok(RedisValue::Integer(size as i64))
+                Ok(RedisValue::Integer(size.try_into()?))
             }
             RedisCommand::LPush {
                 list_name,
@@ -135,7 +131,7 @@ impl RedisConnection {
                     &list_name,
                     elements.iter().map(|e| Value::new(e.clone(), None)),
                 );
-                Ok(RedisValue::Integer(size as i64))
+                Ok(RedisValue::Integer(size.try_into()?))
             }
             RedisCommand::LRange {
                 list_name,
@@ -152,6 +148,10 @@ impl RedisConnection {
                 } else {
                     Ok(RedisValue::Array(vec![]))
                 }
+            }
+            RedisCommand::LLen { list_name } => {
+                tracing::info!("LLen on {list_name:?}");
+                Ok(RedisValue::Integer(self.db.llen(&list_name).try_into()?))
             }
         }
     }

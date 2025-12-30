@@ -1,7 +1,6 @@
 use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Instant};
 
 use anyhow::Result;
-use dashmap::DashMap;
 use tokio::{
     net::TcpListener,
     sync::mpsc::{Receiver, Sender},
@@ -10,9 +9,13 @@ use tokio::{
 
 use crate::{
     connection::RedisConnection,
-    server::types::{Database, ExpiryEvent, RedisKey, Value, INITIAL_CAPACITY},
+    server::{
+        database::{Database, INITIAL_CAPACITY},
+        types::{ExpiryEvent, RedisKey},
+    },
 };
 
+pub(crate) mod database;
 pub(crate) mod types;
 
 pub struct Redis {

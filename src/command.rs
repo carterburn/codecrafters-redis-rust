@@ -28,6 +28,9 @@ pub(crate) enum RedisCommand {
         start: isize,
         end: isize,
     },
+    LLen {
+        list_name: Bytes,
+    },
 }
 
 impl RedisCommand {
@@ -129,6 +132,10 @@ impl RedisCommand {
                     start,
                     end,
                 })
+            }
+            "LLEN" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                Ok(Self::LLen { list_name })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }
