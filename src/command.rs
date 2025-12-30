@@ -21,8 +21,8 @@ pub(crate) enum RedisCommand {
     },
     LRange {
         list_name: Bytes,
-        start: usize,
-        end: usize,
+        start: isize,
+        end: isize,
     },
 }
 
@@ -108,8 +108,8 @@ impl RedisCommand {
                 let end = Self::expect_bulk_string(&values, 3)?;
                 let start = str::from_utf8(&start)?;
                 let end = str::from_utf8(&end)?;
-                let start: usize = start.parse()?;
-                let end: usize = end.parse()?;
+                let start: isize = start.parse()?;
+                let end: isize = end.parse()?;
 
                 Ok(Self::LRange {
                     list_name,

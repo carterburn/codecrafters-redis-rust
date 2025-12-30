@@ -76,7 +76,7 @@ impl Database {
     pub(crate) fn get_key_expiration(&self, key: &RedisKey) -> Option<Instant> {
         self.kv.get(key).and_then(|v| {
             let exp = v.get_expiration()?;
-            Some(exp.clone())
+            Some(*exp)
         })
     }
 
@@ -97,13 +97,22 @@ impl Database {
         list.len()
     }
 
-    pub(crate) fn lrange(
-        &self,
-        key: &RedisKey,
-        start: usize,
-        mut end: usize,
-    ) -> Option<Vec<Value>> {
+    pub(crate) fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Value>> {
         let list = self.lists.get(key)?;
+        // adjust negative start / end to actual indices
+        let start: usize = if start < 0 {
+            let abs_start = start.abs().try_into().ok()?;
+            list.len().saturating_sub(abs_start)
+        } else {
+            start.try_into().ok()?
+        };
+        let mut end: usize = if end < 0 {
+            let abs_end = end.abs().try_into().ok()?;
+            list.len().saturating_sub(abs_end)
+        } else {
+            end.try_into().ok()?
+        };
+
         if start >= list.len() {
             return None;
         }
@@ -115,7 +124,7 @@ impl Database {
             return None;
         }
 
-        Some(list[start..=end].iter().map(|v| v.clone()).collect())
+        Some(list[start..=end].to_vec())
     }
 
     pub(crate) fn kv(&self) -> Arc<DashMap<RedisKey, Value>> {
