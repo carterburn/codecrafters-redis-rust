@@ -5,7 +5,7 @@ use dashmap::DashMap;
 
 pub(crate) type RedisKey = Bytes;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Value {
     /// The actual value
     value: Bytes,
@@ -136,15 +136,15 @@ impl Database {
         }
 
         let (head, tail) = list.as_slices();
-        Some(if start > head.len() {
+        Some(if start >= head.len() {
             // all indices are in tail, so just adjust the indices by head.len()
             tracing::info!("Indices in tail: {start} {end} {}", head.len());
             tail[start - head.len()..=end - head.len()].to_vec()
-        } else if end > head.len() {
+        } else if end >= head.len() {
             tracing::info!("Split indices: {start} {end} {}", head.len());
             // start starts in head and consumes the rest, then finishes off in tail
             let mut first = head[start..].to_vec();
-            let second = tail[..end - head.len()].to_vec();
+            let second = tail[..=end - head.len()].to_vec();
             first.extend(second);
             first
         } else {
