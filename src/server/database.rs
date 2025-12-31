@@ -120,4 +120,9 @@ impl Database {
             None => 0,
         }
     }
+
+    pub(crate) fn lpop(&self, key: &RedisKey) -> Option<Value> {
+        let mut list = self.lists.get_mut(key)?;
+        list.pop_front()
+    }
 }

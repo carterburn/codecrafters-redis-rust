@@ -31,6 +31,9 @@ pub(crate) enum RedisCommand {
     LLen {
         list_name: Bytes,
     },
+    LPop {
+        list_name: Bytes,
+    },
 }
 
 impl RedisCommand {
@@ -136,6 +139,10 @@ impl RedisCommand {
             "LLEN" => {
                 let list_name = Self::expect_bulk_string(&values, 1)?;
                 Ok(Self::LLen { list_name })
+            }
+            "LPOP" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                Ok(Self::LPop { list_name })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }
