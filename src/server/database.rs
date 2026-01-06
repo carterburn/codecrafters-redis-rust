@@ -125,4 +125,13 @@ impl Database {
         let mut list = self.lists.get_mut(key)?;
         list.pop_front()
     }
+
+    pub(crate) fn lpop_many(&self, key: &RedisKey, num_pops: usize) -> Option<Vec<Value>> {
+        let mut list = self.lists.get_mut(key)?;
+        Some(
+            (0..num_pops.min(list.len()))
+                .filter_map(|_| list.pop_front())
+                .collect(),
+        )
+    }
 }

@@ -153,13 +153,30 @@ impl RedisConnection {
                 tracing::info!("LLen on {list_name:?}");
                 Ok(RedisValue::Integer(self.db.llen(&list_name).try_into()?))
             }
-            RedisCommand::LPop { list_name } => {
-                tracing::info!("LPop on {list_name:?}");
-                Ok(self
-                    .db
-                    .lpop(&list_name)
-                    .map(|v| RedisValue::BulkString(v.get_value()))
-                    .unwrap_or(RedisValue::NullBulkString))
+            RedisCommand::LPop {
+                list_name,
+                num_pops,
+            } => {
+                tracing::info!("LPop on {list_name:?} with num pops: {num_pops:?}");
+                if let Some(num) = num_pops {
+                    Ok(self
+                        .db
+                        .lpop_many(&list_name, num)
+                        .map(|v| {
+                            RedisValue::Array(
+                                v.iter()
+                                    .map(|val| RedisValue::BulkString(val.get_value()))
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or(RedisValue::NullBulkString))
+                } else {
+                    Ok(self
+                        .db
+                        .lpop(&list_name)
+                        .map(|v| RedisValue::BulkString(v.get_value()))
+                        .unwrap_or(RedisValue::NullBulkString))
+                }
             }
         }
     }
