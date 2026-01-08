@@ -35,6 +35,10 @@ pub(crate) enum RedisCommand {
         list_name: Bytes,
         num_pops: Option<usize>,
     },
+    BLPop {
+        list_name: Bytes,
+        timeout: f64,
+    },
 }
 
 impl RedisCommand {
@@ -155,6 +159,14 @@ impl RedisCommand {
                     list_name,
                     num_pops,
                 })
+            }
+            "BLPOP" => {
+                let list_name = Self::expect_bulk_string(&values, 1)?;
+                let timeout = Self::expect_bulk_string(&values, 2)?;
+                let timeout: &str = str::from_utf8(&timeout[..])?;
+                let timeout: f64 = timeout.parse()?;
+
+                Ok(Self::BLPop { list_name, timeout })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }

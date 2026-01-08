@@ -178,6 +178,16 @@ impl RedisConnection {
                         .unwrap_or(RedisValue::NullBulkString))
                 }
             }
+            RedisCommand::BLPop { list_name, timeout } => {
+                tracing::info!("BLPop on {list_name:?} with timeout of: {timeout:?}");
+                match self.db.blpop(&list_name, timeout).await {
+                    Some(v) => Ok(RedisValue::Array(vec![
+                        RedisValue::BulkString(list_name.clone()),
+                        RedisValue::BulkString(v.get_value()),
+                    ])),
+                    None => Ok(RedisValue::NullBulkString),
+                }
+            }
         }
     }
 }

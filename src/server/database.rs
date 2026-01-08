@@ -3,7 +3,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 pub(crate) const INITIAL_CAPACITY: usize = 16;
 
@@ -13,6 +14,9 @@ pub(crate) struct Database {
 
     /// List support
     lists: Arc<DashMap<RedisKey, VecDeque<Value>>>,
+
+    /// clients waiting on blpop
+    blocking: Arc<DashMap<RedisKey, VecDeque<oneshot::Sender<bool>>>>,
 }
 
 impl Database {
@@ -20,6 +24,7 @@ impl Database {
         Self {
             kv: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
             lists: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
+            blocking: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
         }
     }
 
@@ -54,6 +59,7 @@ impl Database {
             .entry(key.clone())
             .or_insert(VecDeque::with_capacity(INITIAL_CAPACITY));
         list.extend(value);
+        self.notify_blocker(key);
         list.len()
     }
 
@@ -65,7 +71,21 @@ impl Database {
         for v in value {
             list.push_front(v);
         }
+        self.notify_blocker(key);
         list.len()
+    }
+
+    fn notify_blocker(&self, key: &RedisKey) {
+        // notify any blockers that a new key has been pushed somewhere
+        tracing::info!("Checking blockers");
+        let Some(mut waiters) = self.blocking.get_mut(key) else {
+            tracing::info!("Did not find key {key:?} in blockers");
+            return;
+        };
+        if let Some(ch) = waiters.pop_front() {
+            tracing::info!("Found channel; sending signal");
+            let _ = ch.send(true);
+        }
     }
 
     pub(crate) fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Value>> {
@@ -133,5 +153,52 @@ impl Database {
                 .filter_map(|_| list.pop_front())
                 .collect(),
         )
+    }
+
+    pub(crate) async fn blpop(&self, key: &RedisKey, timeout: f64) -> Option<Value> {
+        {
+            // ensure we don't have deadlock by doing this in a block
+            let mut list = self.lists.get_mut(key)?;
+
+            // if the list is NOT empty, just do normal LPOP operation
+            if !list.is_empty() {
+                return list.pop_front();
+            }
+        }
+
+        // otherwise, we need to setup infrastructure to block until we are told something is
+        // available on the list
+        let (wait_tx, wait_rx) = oneshot::channel();
+        // push this sender onto the queue to be notified if a PUSH was made
+        {
+            // ensure there is no deadlock
+            let mut waiters = self.blocking.entry(key.clone()).or_default();
+            waiters.push_back(wait_tx);
+        }
+
+        // wait for the timeout or something to be added to the list
+        tokio::select! {
+            _ = async {
+                if timeout == 0.0 {
+                    tracing::info!("Indefinite wait on {key:?}");
+                    std::future::pending::<()>().await
+                } else {
+                    tracing::info!("Waiting on {key:?} for {timeout}");
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(Instant::now() + Duration::from_secs_f64(timeout))).await
+                }
+            } => {
+                // timeout reached!
+                None
+            },
+            Ok(_) = wait_rx => {
+                // value add to the list! check and pop
+                let mut list = self.lists.get_mut(key)?;
+                if !list.is_empty() {
+                    list.pop_front()
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
