@@ -185,7 +185,7 @@ impl RedisConnection {
                         RedisValue::BulkString(list_name.clone()),
                         RedisValue::BulkString(v.get_value()),
                     ])),
-                    None => Ok(RedisValue::NullBulkString),
+                    None => Ok(RedisValue::NullArray),
                 }
             }
         }
