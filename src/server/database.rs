@@ -158,12 +158,13 @@ impl Database {
     pub(crate) async fn blpop(&self, key: &RedisKey, timeout: f64) -> Option<Value> {
         {
             // ensure we don't have deadlock by doing this in a block
-            let mut list = self.lists.get_mut(key)?;
-
-            // if the list is NOT empty, just do normal LPOP operation
-            if !list.is_empty() {
-                return list.pop_front();
+            if let Some(mut list) = self.lists.get_mut(key) {
+                // if the list is NOT empty, just do normal LPOP operation
+                if !list.is_empty() {
+                    return list.pop_front();
+                }
             }
+            // if the list doesn't exist, we still setup the block
         }
 
         // otherwise, we need to setup infrastructure to block until we are told something is
@@ -193,11 +194,7 @@ impl Database {
             Ok(_) = wait_rx => {
                 // value add to the list! check and pop
                 let mut list = self.lists.get_mut(key)?;
-                if !list.is_empty() {
-                    list.pop_front()
-                } else {
-                    None
-                }
+                list.pop_front()
             }
         }
     }
