@@ -1,20 +1,26 @@
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use bytes::Bytes;
 
 pub(crate) type RedisKey = Bytes;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Value {
+pub enum RedisDataType {
+    String(Bytes),
+    List(VecDeque<Bytes>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredValue {
     /// The actual value
-    value: Bytes,
+    pub value: RedisDataType,
 
     /// Last set time (if key was set with expirations)
     expiration: Option<Instant>,
 }
 
-impl Value {
-    pub(crate) fn new(value: Bytes, expiration: Option<Instant>) -> Self {
+impl StoredValue {
+    pub(crate) fn new(value: RedisDataType, expiration: Option<Instant>) -> Self {
         Self { value, expiration }
     }
 
@@ -33,12 +39,33 @@ impl Value {
         }
     }
 
-    pub(crate) fn get_value(&self) -> Bytes {
-        self.value.slice(..)
+    pub(crate) fn get_value(&self) -> &RedisDataType {
+        &self.value
     }
 
     pub(crate) fn get_expiration(&self) -> Option<&Instant> {
         self.expiration.as_ref()
+    }
+
+    pub(crate) fn as_string(&self) -> Option<Bytes> {
+        match &self.value {
+            RedisDataType::String(s) => Some(s.slice(..)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_list(&self) -> Option<&VecDeque<Bytes>> {
+        match &self.value {
+            RedisDataType::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_list_mut(&mut self) -> Option<&mut VecDeque<Bytes>> {
+        match &mut self.value {
+            RedisDataType::List(l) => Some(l),
+            _ => None,
+        }
     }
 }
 

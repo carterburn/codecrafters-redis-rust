@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 
-use crate::resp::RedisValue;
+use crate::resp::RespValue;
 
 use std::{num::ParseIntError, str::Utf8Error};
 
@@ -48,15 +48,15 @@ pub(crate) enum RedisIntermediate {
 }
 
 impl RedisIntermediate {
-    pub(crate) fn generate_value(self, buffer: &Bytes) -> RedisValue {
+    pub(crate) fn generate_value(self, buffer: &Bytes) -> RespValue {
         match self {
-            Self::SimpleString(br) => RedisValue::SimpleString(buffer.slice(br.0..br.1)),
-            Self::SimpleError(br) => RedisValue::SimpleError(buffer.slice(br.0..br.1)),
-            Self::Integer(i) => RedisValue::Integer(i),
-            Self::NullBulkString => RedisValue::NullBulkString,
-            Self::BulkString(br) => RedisValue::BulkString(buffer.slice(br.0..br.1)),
-            Self::NullArray => RedisValue::NullArray,
-            Self::Array(intermediates) => RedisValue::Array(
+            Self::SimpleString(br) => RespValue::SimpleString(buffer.slice(br.0..br.1)),
+            Self::SimpleError(br) => RespValue::SimpleError(buffer.slice(br.0..br.1)),
+            Self::Integer(i) => RespValue::Integer(i),
+            Self::NullBulkString => RespValue::NullBulkString,
+            Self::BulkString(br) => RespValue::BulkString(buffer.slice(br.0..br.1)),
+            Self::NullArray => RespValue::NullArray,
+            Self::Array(intermediates) => RespValue::Array(
                 intermediates
                     .into_iter()
                     .map(|int| int.generate_value(buffer))
@@ -172,7 +172,7 @@ pub(crate) fn parse(input: &BytesMut, pos: usize) -> ParseResult {
 mod tests {
     use super::*;
 
-    fn setup_parse(input: &[u8]) -> RedisValue {
+    fn setup_parse(input: &[u8]) -> RespValue {
         let mut buf = BytesMut::from(input);
         let (pos, intermediate) = parse(&buf, 0).unwrap().unwrap();
         let parsed = buf.split_to(pos);
@@ -193,7 +193,7 @@ mod tests {
         // how we would use it in the decoder is below
         let parsed = buf.split_to(pos);
         let value = v.generate_value(&parsed.freeze());
-        assert_eq!(value, RedisValue::BulkString(Bytes::from("hello")));
+        assert_eq!(value, RespValue::BulkString(Bytes::from("hello")));
     }
 
     #[test]
@@ -209,9 +209,9 @@ mod tests {
     #[test]
     fn test_simple_string_error_succ() {
         let parsed = setup_parse(&b"+OK\r\n"[..]);
-        assert_eq!(parsed, RedisValue::SimpleString("OK".into()));
+        assert_eq!(parsed, RespValue::SimpleString("OK".into()));
         let parsed = setup_parse(&b"-Error message\r\n"[..]);
-        assert_eq!(parsed, RedisValue::SimpleError("Error message".into()));
+        assert_eq!(parsed, RespValue::SimpleError("Error message".into()));
     }
 
     #[test]
@@ -225,11 +225,11 @@ mod tests {
     #[test]
     fn test_integer_succ() {
         let parsed = setup_parse(&b":0\r\n"[..]);
-        assert_eq!(parsed, RedisValue::Integer(0));
+        assert_eq!(parsed, RespValue::Integer(0));
         let parsed = setup_parse(&b":100\r\n"[..]);
-        assert_eq!(parsed, RedisValue::Integer(100));
+        assert_eq!(parsed, RespValue::Integer(100));
         let parsed = setup_parse(&b":-100\r\n"[..]);
-        assert_eq!(parsed, RedisValue::Integer(-100));
+        assert_eq!(parsed, RespValue::Integer(-100));
     }
 
     #[test]
@@ -241,11 +241,11 @@ mod tests {
     #[test]
     fn test_bulk_string_succ() {
         let parsed = setup_parse(&b"$-1\r\n"[..]);
-        assert_eq!(parsed, RedisValue::NullBulkString);
+        assert_eq!(parsed, RespValue::NullBulkString);
         let parsed = setup_parse(&b"$5\r\nhello\r\n"[..]);
-        assert_eq!(parsed, RedisValue::BulkString("hello".into()));
+        assert_eq!(parsed, RespValue::BulkString("hello".into()));
         let parsed = setup_parse(&b"$0\r\n\r\n"[..]);
-        assert_eq!(parsed, RedisValue::BulkString("".into()));
+        assert_eq!(parsed, RespValue::BulkString("".into()));
     }
 
     #[test]
@@ -261,24 +261,24 @@ mod tests {
     #[test]
     fn test_array_succ() {
         let parsed = setup_parse(&b"*-1\r\n"[..]);
-        assert_eq!(parsed, RedisValue::NullArray);
+        assert_eq!(parsed, RespValue::NullArray);
         let parsed = setup_parse(&b"*0\r\n"[..]);
-        assert_eq!(parsed, RedisValue::Array(vec![]));
+        assert_eq!(parsed, RespValue::Array(vec![]));
         let parsed = setup_parse(&b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n"[..]);
         assert_eq!(
             parsed,
-            RedisValue::Array(vec![
-                RedisValue::BulkString("hello".into()),
-                RedisValue::BulkString("world".into())
+            RespValue::Array(vec![
+                RespValue::BulkString("hello".into()),
+                RespValue::BulkString("world".into())
             ])
         );
         let parsed = setup_parse(&b"*3\r\n:1\r\n:2\r\n:3\r\n"[..]);
         assert_eq!(
             parsed,
-            RedisValue::Array(vec![
-                RedisValue::Integer(1),
-                RedisValue::Integer(2),
-                RedisValue::Integer(3)
+            RespValue::Array(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(2),
+                RespValue::Integer(3)
             ])
         );
     }
@@ -288,27 +288,27 @@ mod tests {
         let parsed = setup_parse(&b"*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$5\r\nhello\r\n"[..]);
         assert_eq!(
             parsed,
-            RedisValue::Array(vec![
-                RedisValue::Integer(1),
-                RedisValue::Integer(2),
-                RedisValue::Integer(3),
-                RedisValue::Integer(4),
-                RedisValue::BulkString("hello".into()),
+            RespValue::Array(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(2),
+                RespValue::Integer(3),
+                RespValue::Integer(4),
+                RespValue::BulkString("hello".into()),
             ])
         );
 
         let parsed = setup_parse(&b"*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n-World\r\n"[..]);
         assert_eq!(
             parsed,
-            RedisValue::Array(vec![
-                RedisValue::Array(vec![
-                    RedisValue::Integer(1),
-                    RedisValue::Integer(2),
-                    RedisValue::Integer(3),
+            RespValue::Array(vec![
+                RespValue::Array(vec![
+                    RespValue::Integer(1),
+                    RespValue::Integer(2),
+                    RespValue::Integer(3),
                 ]),
-                RedisValue::Array(vec![
-                    RedisValue::SimpleString("Hello".into()),
-                    RedisValue::SimpleError("World".into()),
+                RespValue::Array(vec![
+                    RespValue::SimpleString("Hello".into()),
+                    RespValue::SimpleError("World".into()),
                 ]),
             ])
         );
@@ -327,14 +327,14 @@ mod tests {
         let parsed = input.split_to(pos);
         assert_eq!(
             intermediate.generate_value(&parsed.freeze()),
-            RedisValue::SimpleString("OK".into())
+            RespValue::SimpleString("OK".into())
         );
         // parse the input again from index 0
         let (pos, intermediate) = parse(&input, 0).unwrap().unwrap();
         let parsed = input.split_to(pos);
         assert_eq!(
             intermediate.generate_value(&parsed.freeze()),
-            RedisValue::Integer(100)
+            RespValue::Integer(100)
         );
     }
 }

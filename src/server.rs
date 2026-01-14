@@ -3,15 +3,20 @@ use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Instant};
 use anyhow::Result;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        oneshot,
+    },
     time::sleep_until,
 };
 
 use crate::{
+    command::{ExecutorCommand, RedisCommand},
     connection::RedisConnection,
+    resp::RespValue,
     server::{
         database::{Database, INITIAL_CAPACITY},
-        types::{ExpiryEvent, RedisKey},
+        types::{ExpiryEvent, RedisDataType, RedisKey, StoredValue},
     },
 };
 
@@ -21,26 +26,34 @@ pub(crate) mod types;
 pub struct Redis {
     /// TCP Listener on given port
     listener: TcpListener,
-    // Clients connected -> should be join handles or arc of the clients?
-    /// The global key/value store
-    db: Arc<Database>,
 
-    /// The channel to send expiration events on
-    expiration_tx: Sender<ExpiryEvent>,
+    /// Handle to the executor task
+    executor_tx: mpsc::Sender<ExecutorCommand>,
+    // Clients connected -> should be join handles or arc of the clients?
+    // The global key/value store
+    // db: Arc<Database>,
+
+    // The channel to send expiration events on
+    // expiration_tx: Sender<ExpiryEvent>,
 }
 
 impl Redis {
-    pub async fn new(port: u16) -> Result<Self> {
-        let db = Arc::new(Database::new());
+    const BACKPRESSURE: usize = 10_000;
 
-        // create task to expire keys
-        let (tx, rx) = tokio::sync::mpsc::channel::<ExpiryEvent>(INITIAL_CAPACITY);
-        tokio::spawn(Self::key_expirer(db.clone(), rx));
+    pub async fn new(port: u16) -> Result<Self> {
+        let db = Database::new();
+        let (tx, rx) = mpsc::channel(Self::BACKPRESSURE);
+
+        // spawn the executor task :
+        tokio::spawn(Self::executor(db, rx));
+
+        // create task to expire keys : TODO : need to get this working with the new arch
+        // let (tx, rx) = tokio::sync::mpsc::channel::<ExpiryEvent>(INITIAL_CAPACITY);
+        // tokio::spawn(Self::key_expirer(db.clone(), rx));
 
         Ok(Self {
             listener: TcpListener::bind(("127.0.0.1", port)).await?,
-            db,
-            expiration_tx: tx,
+            executor_tx: tx,
         })
     }
 
@@ -49,18 +62,29 @@ impl Redis {
         while let Ok((client_stream, client_addr)) = self.listener.accept().await {
             tracing::info!("New connection from: {client_addr}");
 
-            let mut client = RedisConnection::new(
-                client_stream,
-                client_addr,
-                self.db.clone(),
-                self.expiration_tx.clone(),
-            );
+            let mut client = RedisConnection::new(client_stream, self.executor_tx.clone());
 
             tokio::spawn(async move { client.client_loop().await });
         }
         Ok(())
     }
 
+    async fn executor(mut db: Database, mut rx: Receiver<ExecutorCommand>) {
+        while let Some(cmd) = rx.recv().await {
+            match db.handle_cmd(cmd.command) {
+                Ok(r) => {
+                    let _ = cmd.respond_to.send(r);
+                }
+                Err(e) => {
+                    let _ = cmd.respond_to.send(crate::command::ExecutorResponse::Value(
+                        RespValue::SimpleError(format!("{e:?}").into()),
+                    ));
+                }
+            }
+        }
+    }
+
+    /*
     async fn key_expirer(db: Arc<Database>, mut expiry_rx: Receiver<ExpiryEvent>) {
         // binary min-heap to provide O(1) selection of next key to grab
         let mut expiry_queue: BinaryHeap<Reverse<(Instant, RedisKey)>> =
@@ -109,4 +133,5 @@ impl Redis {
             }
         }
     }
+    */
 }

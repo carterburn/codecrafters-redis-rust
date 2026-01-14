@@ -1,45 +1,48 @@
 use anyhow::Result;
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use std::{net::SocketAddr, sync::Arc, time::Instant};
-use tokio::{net::TcpStream, sync::mpsc::Sender};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    net::TcpStream,
+    sync::{
+        mpsc::{self, Sender},
+        oneshot::{self, Receiver},
+    },
+};
 use tokio_util::codec::Framed;
 
 use crate::{
-    command::RedisCommand,
-    resp::{codec::RespFrame, RedisValue},
-    server::database::Database,
-    server::types::{ExpiryEvent, Value},
+    command::{ExecutorCommand, ExecutorResponse, RedisCommand},
+    resp::{codec::RespFrame, RespValue},
+    server::{
+        database::Database,
+        types::{ExpiryEvent, RedisDataType, StoredValue},
+    },
 };
 
 /// A type representing an active client connection
 pub(crate) struct RedisConnection {
-    /// Client address
-    client_addr: SocketAddr,
-
     /// Frame to read and write data to the client
     frame: Framed<TcpStream, RespFrame>,
 
-    /// Reference to the global key / value store
-    db: Arc<Database>,
+    /// channel to the executor task
+    executor_tx: mpsc::Sender<ExecutorCommand>,
     // big question here is would it be better to have this serialized through channels? i.e. have
     // a single channel I ask for a key for...? we'll see
     //
-    /// Place to send newly set keys
-    expiration_tx: Sender<ExpiryEvent>,
+    // Place to send newly set keys
+    // TODO: fix expiration_tx: Sender<ExpiryEvent>,
 }
 
 impl RedisConnection {
-    pub(crate) fn new(
-        stream: TcpStream,
-        client_addr: SocketAddr,
-        db: Arc<Database>,
-        expiration_tx: Sender<ExpiryEvent>,
-    ) -> Self {
+    pub(crate) fn new(stream: TcpStream, executor_tx: mpsc::Sender<ExecutorCommand>) -> Self {
         Self {
-            client_addr,
             frame: Framed::new(stream, RespFrame),
-            db,
-            expiration_tx,
+            executor_tx,
         }
     }
 
@@ -57,16 +60,34 @@ impl RedisConnection {
                         }
                     };
 
-                    let response = match self.handle_cmd(cmd).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("Error handling command: {e:?}");
-                            self.send_error(e).await;
-                            continue;
-                        }
+                    let (tx, rx) = oneshot::channel();
+                    if let Err(e) = self
+                        .executor_tx
+                        .send(ExecutorCommand {
+                            command: cmd,
+                            respond_to: tx,
+                        })
+                        .await
+                    {
+                        tracing::error!("Error sending command to executor: {e:?}");
+                        break;
+                    }
+
+                    // listen for response to send back
+                    let Ok(response) = rx.await else {
+                        tracing::error!("Error receiving response");
+                        continue;
                     };
 
-                    let _ = self.frame.send(response).await;
+                    match response {
+                        ExecutorResponse::Value(v) => {
+                            let _ = self.frame.send(v).await;
+                        }
+                        ExecutorResponse::Blocking { rx, key, timeout } => {
+                            let block_response = self.block(rx, key, timeout).await;
+                            let _ = self.frame.send(block_response).await;
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Received error while decoding message: {e:?}");
@@ -80,113 +101,26 @@ impl RedisConnection {
     async fn send_error(&mut self, e: anyhow::Error) {
         let _ = self
             .frame
-            .send(RedisValue::SimpleError(format!("{e:?}").into()))
+            .send(RespValue::SimpleError(format!("{e:?}").into()))
             .await;
     }
 
-    async fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<RedisValue> {
-        match cmd {
-            RedisCommand::Ping => Ok(RedisValue::SimpleString("PONG".into())),
-            RedisCommand::Echo(msg) => Ok(RedisValue::BulkString(msg)),
-            RedisCommand::Get(key) => match self.db.get_key(&key) {
-                Some(v) => {
-                    tracing::info!("Returning value: {:?}", v);
-                    Ok(RedisValue::BulkString(v))
+    async fn block(&mut self, rx: Receiver<Bytes>, key: Bytes, timeout: f64) -> RespValue {
+        tokio::select! {
+            _ = async {
+                if timeout == 0.0 {
+                    tracing::info!("Indefinite wait for {key:?}");
+                    std::future::pending::<()>().await
+                } else {
+                    tracing::info!("Waiting for {timeout} on {key:?}");
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(Instant::now() + Duration::from_secs_f64(timeout))).await
                 }
-                _ => Ok(RedisValue::NullBulkString),
+            } => {
+                // timeout reached!
+                RespValue::NullArray
             },
-            RedisCommand::Set {
-                key,
-                value,
-                expiration,
-            } => {
-                let exp = expiration.map(|dur| Instant::now() + dur);
-                tracing::info!("Set {:?} -> {:?} with expiration at: {exp:?}", key, value);
-
-                let val = Value::new(value, exp);
-                self.db.set_key(&key, val);
-                // send our new expiration time to the channel if needed
-                if let Some(time) = exp {
-                    let _ = self.expiration_tx.send((time, key)).await;
-                };
-                Ok(RedisValue::SimpleString("OK".into()))
-            }
-            RedisCommand::RPush {
-                list_name,
-                elements,
-            } => {
-                tracing::info!("RPush to {list_name:?} with elements: {elements:?}");
-                let size = self.db.rpush(
-                    &list_name,
-                    elements.iter().map(|e| Value::new(e.clone(), None)),
-                );
-                Ok(RedisValue::Integer(size.try_into()?))
-            }
-            RedisCommand::LPush {
-                list_name,
-                elements,
-            } => {
-                tracing::info!("LPush to {list_name:?} with elements: {elements:?}");
-                let size = self.db.lpush(
-                    &list_name,
-                    elements.iter().map(|e| Value::new(e.clone(), None)),
-                );
-                Ok(RedisValue::Integer(size.try_into()?))
-            }
-            RedisCommand::LRange {
-                list_name,
-                start,
-                end,
-            } => {
-                tracing::info!("LRange on {list_name:?} for range: {start}..={end}");
-                if let Some(vals) = self.db.lrange(&list_name, start, end) {
-                    Ok(RedisValue::Array(
-                        vals.iter()
-                            .map(|v| RedisValue::BulkString(v.get_value()))
-                            .collect(),
-                    ))
-                } else {
-                    Ok(RedisValue::Array(vec![]))
-                }
-            }
-            RedisCommand::LLen { list_name } => {
-                tracing::info!("LLen on {list_name:?}");
-                Ok(RedisValue::Integer(self.db.llen(&list_name).try_into()?))
-            }
-            RedisCommand::LPop {
-                list_name,
-                num_pops,
-            } => {
-                tracing::info!("LPop on {list_name:?} with num pops: {num_pops:?}");
-                if let Some(num) = num_pops {
-                    Ok(self
-                        .db
-                        .lpop_many(&list_name, num)
-                        .map(|v| {
-                            RedisValue::Array(
-                                v.iter()
-                                    .map(|val| RedisValue::BulkString(val.get_value()))
-                                    .collect(),
-                            )
-                        })
-                        .unwrap_or(RedisValue::NullBulkString))
-                } else {
-                    Ok(self
-                        .db
-                        .lpop(&list_name)
-                        .map(|v| RedisValue::BulkString(v.get_value()))
-                        .unwrap_or(RedisValue::NullBulkString))
-                }
-            }
-            RedisCommand::BLPop { list_name, timeout } => {
-                tracing::info!("BLPop on {list_name:?} with timeout of: {timeout:?}");
-                match self.db.blpop(&list_name, timeout).await {
-                    Some(v) => Ok(RedisValue::Array(vec![
-                        RedisValue::BulkString(list_name.clone()),
-                        RedisValue::BulkString(v.get_value()),
-                    ])),
-                    None => Ok(RedisValue::NullArray),
-                }
+            Ok(value) = rx => {
+                RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value.clone())])
             }
         }
     }

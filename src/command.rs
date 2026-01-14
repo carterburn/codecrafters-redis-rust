@@ -1,10 +1,32 @@
 use core::str;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
+use tokio::sync::oneshot;
 
-use crate::resp::RedisValue;
+use crate::{
+    resp::RespValue,
+    server::{
+        database::Database,
+        types::{RedisDataType, StoredValue},
+    },
+};
+
+pub(crate) struct ExecutorCommand {
+    pub command: RedisCommand,
+
+    pub respond_to: oneshot::Sender<ExecutorResponse>,
+}
+
+pub(crate) enum ExecutorResponse {
+    Value(RespValue),
+    Blocking {
+        rx: oneshot::Receiver<Bytes>,
+        key: Bytes,
+        timeout: f64,
+    },
+}
 
 pub(crate) enum RedisCommand {
     Ping,
@@ -39,12 +61,15 @@ pub(crate) enum RedisCommand {
         list_name: Bytes,
         timeout: f64,
     },
+    Type {
+        key_name: Bytes,
+    },
 }
 
 impl RedisCommand {
-    pub(crate) fn parse(msg: RedisValue) -> Result<Self> {
-        // ensure that RedisValue is a BulkArray
-        let RedisValue::Array(values) = msg else {
+    pub(crate) fn parse(msg: RespValue) -> Result<Self> {
+        // ensure that RespValue is a BulkArray
+        let RespValue::Array(values) = msg else {
             tracing::error!("Invalid message, expected bulk array");
             Err(anyhow::anyhow!("Invalid message"))?
         };
@@ -52,7 +77,7 @@ impl RedisCommand {
         let cmd = values
             .first()
             .and_then(|v| match v {
-                RedisValue::BulkString(s) => {
+                RespValue::BulkString(s) => {
                     // attempt to interpret as String
                     let s = str::from_utf8(&s[..]).ok()?;
                     Some(s.to_uppercase())
@@ -168,15 +193,19 @@ impl RedisCommand {
 
                 Ok(Self::BLPop { list_name, timeout })
             }
+            "TYPE" => {
+                let key_name = Self::expect_bulk_string(&values, 1)?;
+                Ok(Self::Type { key_name })
+            }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }
     }
 
-    fn expect_bulk_string(values: &[RedisValue], index: usize) -> Result<Bytes> {
+    fn expect_bulk_string(values: &[RespValue], index: usize) -> Result<Bytes> {
         values
             .get(index)
             .and_then(|redis_val| match redis_val {
-                RedisValue::BulkString(b) => Some(b.slice(..)),
+                RespValue::BulkString(b) => Some(b.slice(..)),
                 _ => None,
             })
             .ok_or(anyhow::anyhow!(
@@ -185,7 +214,7 @@ impl RedisCommand {
     }
 }
 
-fn process_time<F>(dur: &RedisValue, f: F) -> Result<Duration>
+fn process_time<F>(dur: &RespValue, f: F) -> Result<Duration>
 where
     F: Fn(u64) -> Duration,
 {

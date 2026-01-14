@@ -1,37 +1,37 @@
-use crate::server::types::{RedisKey, Value};
+use crate::command::{ExecutorResponse, RedisCommand};
+use crate::resp::RespValue;
+use crate::server::types::{RedisDataType, RedisKey, StoredValue};
+use anyhow::Result;
 use bytes::Bytes;
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, Receiver};
 
 pub(crate) const INITIAL_CAPACITY: usize = 16;
 
 pub(crate) struct Database {
-    /// Basic Key/Value store
-    kv: Arc<DashMap<RedisKey, Value>>,
-
-    /// List support
-    lists: Arc<DashMap<RedisKey, VecDeque<Value>>>,
+    /// The data store
+    store: HashMap<RedisKey, StoredValue>,
 
     /// clients waiting on blpop
-    blocking: Arc<DashMap<RedisKey, VecDeque<oneshot::Sender<bool>>>>,
+    blocking: HashMap<RedisKey, VecDeque<oneshot::Sender<Bytes>>>,
 }
 
 impl Database {
     pub(crate) fn new() -> Self {
         Self {
-            kv: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
-            lists: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
-            blocking: Arc::new(DashMap::with_capacity(INITIAL_CAPACITY)),
+            store: HashMap::with_capacity(INITIAL_CAPACITY),
+            blocking: HashMap::with_capacity(INITIAL_CAPACITY),
         }
     }
 
+    /// Get a key for a string value
     pub(crate) fn get_key(&self, key: &RedisKey) -> Option<Bytes> {
-        self.kv.get(key).and_then(|v| {
+        self.store.get(key).and_then(|v| {
             if !v.expired(Instant::now()) {
-                Some(v.get_value())
+                v.as_string()
             } else {
                 None
             }
@@ -39,57 +39,82 @@ impl Database {
     }
 
     pub(crate) fn get_key_expiration(&self, key: &RedisKey) -> Option<Instant> {
-        self.kv.get(key).and_then(|v| {
+        self.store.get(key).and_then(|v| {
             let exp = v.get_expiration()?;
             Some(*exp)
         })
     }
 
-    pub(crate) fn set_key(&self, key: &RedisKey, value: Value) -> Option<Value> {
-        self.kv.insert(key.clone(), value)
+    pub(crate) fn set_key(&mut self, key: &RedisKey, value: StoredValue) -> Option<StoredValue> {
+        self.store.insert(key.clone(), value)
     }
 
-    pub(crate) fn remove_key(&self, key: &RedisKey) {
-        self.kv.remove(key);
+    pub(crate) fn remove_key(&mut self, key: &RedisKey) {
+        self.store.remove(key);
     }
 
-    pub(crate) fn rpush(&self, key: &RedisKey, value: impl Iterator<Item = Value>) -> usize {
-        let mut list = self
-            .lists
-            .entry(key.clone())
-            .or_insert(VecDeque::with_capacity(INITIAL_CAPACITY));
-        list.extend(value);
+    pub(crate) fn rpush(
+        &mut self,
+        key: &RedisKey,
+        values: impl Iterator<Item = Bytes>,
+    ) -> Option<usize> {
+        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
+            StoredValue::new(
+                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
+                None,
+            )
+        });
+
+        let list = stored_value.as_list_mut()?;
+
+        list.extend(values);
+        let len = list.len();
         self.notify_blocker(key);
-        list.len()
+        Some(len)
     }
 
-    pub(crate) fn lpush(&self, key: &RedisKey, value: impl Iterator<Item = Value>) -> usize {
-        let mut list = self
-            .lists
-            .entry(key.clone())
-            .or_insert(VecDeque::with_capacity(INITIAL_CAPACITY));
-        for v in value {
+    pub(crate) fn lpush(
+        &mut self,
+        key: &RedisKey,
+        values: impl Iterator<Item = Bytes>,
+    ) -> Option<usize> {
+        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
+            StoredValue::new(
+                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
+                None,
+            )
+        });
+
+        let list = stored_value.as_list_mut()?;
+
+        for v in values {
             list.push_front(v);
         }
+        let len = list.len();
         self.notify_blocker(key);
-        list.len()
+        Some(len)
     }
 
-    fn notify_blocker(&self, key: &RedisKey) {
+    fn notify_blocker(&mut self, key: &RedisKey) {
         // notify any blockers that a new key has been pushed somewhere
         tracing::info!("Checking blockers");
-        let Some(mut waiters) = self.blocking.get_mut(key) else {
+        let Some(waiters) = self.blocking.get_mut(key) else {
             tracing::info!("Did not find key {key:?} in blockers");
             return;
         };
         if let Some(ch) = waiters.pop_front() {
             tracing::info!("Found channel; sending signal");
-            let _ = ch.send(true);
+            let Some(v) = self.lpop(key) else {
+                tracing::error!("Had a waiter ready, but nothing popped");
+                return;
+            };
+            let _ = ch.send(v);
         }
     }
 
-    pub(crate) fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Value>> {
-        let list = self.lists.get(key)?;
+    pub(crate) fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Bytes>> {
+        let list = self.store.get(key)?;
+        let list = list.as_list()?;
         // adjust negative start / end to actual indices
         let start: usize = if start < 0 {
             let abs_start = start.abs().try_into().ok()?;
@@ -135,19 +160,36 @@ impl Database {
     }
 
     pub(crate) fn llen(&self, key: &RedisKey) -> usize {
-        match self.lists.get(key) {
-            Some(l) => l.len(),
+        match self.store.get(key) {
+            Some(v) => match v.as_list() {
+                Some(l) => l.len(),
+                None => 0,
+            },
             None => 0,
         }
     }
 
-    pub(crate) fn lpop(&self, key: &RedisKey) -> Option<Value> {
-        let mut list = self.lists.get_mut(key)?;
+    pub(crate) fn lpop(&mut self, key: &RedisKey) -> Option<Bytes> {
+        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
+            StoredValue::new(
+                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
+                None,
+            )
+        });
+
+        let list = stored_value.as_list_mut()?;
         list.pop_front()
     }
 
-    pub(crate) fn lpop_many(&self, key: &RedisKey, num_pops: usize) -> Option<Vec<Value>> {
-        let mut list = self.lists.get_mut(key)?;
+    pub(crate) fn lpop_many(&mut self, key: &RedisKey, num_pops: usize) -> Option<Vec<Bytes>> {
+        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
+            StoredValue::new(
+                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
+                None,
+            )
+        });
+
+        let list = stored_value.as_list_mut()?;
         Some(
             (0..num_pops.min(list.len()))
                 .filter_map(|_| list.pop_front())
@@ -155,47 +197,147 @@ impl Database {
         )
     }
 
-    pub(crate) async fn blpop(&self, key: &RedisKey, timeout: f64) -> Option<Value> {
-        {
-            // ensure we don't have deadlock by doing this in a block
-            if let Some(mut list) = self.lists.get_mut(key) {
-                // if the list is NOT empty, just do normal LPOP operation
-                if !list.is_empty() {
-                    return list.pop_front();
-                }
-            }
-            // if the list doesn't exist, we still setup the block
-        }
-
+    pub(crate) fn blpop(&mut self, key: &RedisKey) -> Receiver<Bytes> {
         // otherwise, we need to setup infrastructure to block until we are told something is
         // available on the list
         let (wait_tx, wait_rx) = oneshot::channel();
         // push this sender onto the queue to be notified if a PUSH was made
-        {
-            // ensure there is no deadlock
-            let mut waiters = self.blocking.entry(key.clone()).or_default();
-            waiters.push_back(wait_tx);
-        }
+        // ensure there is no deadlock
+        let waiters = self.blocking.entry(key.clone()).or_default();
+        waiters.push_back(wait_tx);
 
-        // wait for the timeout or something to be added to the list
-        tokio::select! {
-            _ = async {
-                if timeout == 0.0 {
-                    tracing::info!("Indefinite wait on {key:?}");
-                    std::future::pending::<()>().await
-                } else {
-                    tracing::info!("Waiting on {key:?} for {timeout}");
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(Instant::now() + Duration::from_secs_f64(timeout))).await
+        wait_rx
+    }
+
+    pub(crate) fn key_type(&self, key: &RedisKey) -> Option<&'static str> {
+        Some(match self.store.get(key)?.value {
+            RedisDataType::String(_) => "string",
+            RedisDataType::List(_) => "list",
+        })
+    }
+
+    pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
+        match cmd {
+            RedisCommand::Ping => Ok(ExecutorResponse::Value(RespValue::SimpleString(
+                "PONG".into(),
+            ))),
+            RedisCommand::Echo(msg) => Ok(ExecutorResponse::Value(RespValue::BulkString(msg))),
+            RedisCommand::Get(key) => match self.get_key(&key) {
+                Some(v) => {
+                    tracing::info!("Returning value: {:?}", v);
+                    Ok(ExecutorResponse::Value(RespValue::BulkString(v)))
                 }
-            } => {
-                // timeout reached!
-                None
+                _ => Ok(ExecutorResponse::Value(RespValue::NullBulkString)),
             },
-            Ok(_) = wait_rx => {
-                // value add to the list! check and pop
-                let mut list = self.lists.get_mut(key)?;
-                list.pop_front()
+            RedisCommand::Set {
+                key,
+                value,
+                expiration,
+            } => {
+                let exp = expiration.map(|dur| Instant::now() + dur);
+                tracing::info!("Set {:?} -> {:?} with expiration at: {exp:?}", key, value);
+
+                let val = StoredValue::new(RedisDataType::String(value), exp);
+                self.set_key(&key, val);
+                // send our new expiration time to the channel if needed
+                // TODO: fix expiration
+                // if let Some(time) = exp {
+                //     let _ = self.expiration_tx.send((time, key)).await;
+                // };
+                Ok(ExecutorResponse::Value(RespValue::SimpleString(
+                    "OK".into(),
+                )))
             }
+            RedisCommand::RPush {
+                list_name,
+                elements,
+            } => {
+                tracing::info!("RPush to {list_name:?} with elements: {elements:?}");
+                let size = self
+                    .rpush(&list_name, elements.iter().map(|e| e.clone()))
+                    .ok_or(anyhow::anyhow!("Key is not a list"))?;
+                Ok(ExecutorResponse::Value(RespValue::Integer(
+                    size.try_into()?,
+                )))
+            }
+            RedisCommand::LPush {
+                list_name,
+                elements,
+            } => {
+                tracing::info!("LPush to {list_name:?} with elements: {elements:?}");
+                let size = self
+                    .lpush(&list_name, elements.iter().map(|e| e.clone()))
+                    .ok_or(anyhow::anyhow!("Key is not a list"))?;
+                Ok(ExecutorResponse::Value(RespValue::Integer(
+                    size.try_into()?,
+                )))
+            }
+            RedisCommand::LRange {
+                list_name,
+                start,
+                end,
+            } => {
+                tracing::info!("LRange on {list_name:?} for range: {start}..={end}");
+                if let Some(vals) = self.lrange(&list_name, start, end) {
+                    Ok(ExecutorResponse::Value(RespValue::Array(
+                        vals.iter()
+                            .map(|v| RespValue::BulkString(v.slice(..)))
+                            .collect(),
+                    )))
+                } else {
+                    Ok(ExecutorResponse::Value(RespValue::Array(vec![])))
+                }
+            }
+            RedisCommand::LLen { list_name } => {
+                tracing::info!("LLen on {list_name:?}");
+                Ok(ExecutorResponse::Value(RespValue::Integer(
+                    self.llen(&list_name).try_into()?,
+                )))
+            }
+            RedisCommand::LPop {
+                list_name,
+                num_pops,
+            } => {
+                tracing::info!("LPop on {list_name:?} with num pops: {num_pops:?}");
+                if let Some(num) = num_pops {
+                    Ok(ExecutorResponse::Value(
+                        self.lpop_many(&list_name, num)
+                            .map(|v| {
+                                RespValue::Array(
+                                    v.iter()
+                                        .map(|val| RespValue::BulkString(val.slice(..)))
+                                        .collect(),
+                                )
+                            })
+                            .unwrap_or(RespValue::NullBulkString),
+                    ))
+                } else {
+                    Ok(ExecutorResponse::Value(
+                        self.lpop(&list_name)
+                            .map(|v| RespValue::BulkString(v.slice(..)))
+                            .unwrap_or(RespValue::NullBulkString),
+                    ))
+                }
+            }
+            RedisCommand::BLPop { list_name, timeout } => {
+                tracing::info!("BLPop on {list_name:?} with timeout of: {timeout:?}");
+                // first check if there is something in the list to start
+                if let Some(v) = self.lpop(&list_name) {
+                    return Ok(ExecutorResponse::Value(RespValue::BulkString(v.slice(..))));
+                }
+
+                let wait_rx = self.blpop(&list_name);
+                Ok(ExecutorResponse::Blocking {
+                    rx: wait_rx,
+                    key: list_name.clone(),
+                    timeout,
+                })
+            }
+            RedisCommand::Type { key_name } => Ok(ExecutorResponse::Value(
+                self.key_type(&key_name)
+                    .map(|s| RespValue::SimpleString(s.into()))
+                    .unwrap_or(RespValue::SimpleString("none".into())),
+            )),
         }
     }
 }
