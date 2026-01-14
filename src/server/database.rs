@@ -38,26 +38,22 @@ impl Database {
         })
     }
 
-    pub(crate) fn get_key_expiration(&self, key: &RedisKey) -> Option<Instant> {
+    fn get_key_expiration(&self, key: &RedisKey) -> Option<Instant> {
         self.store.get(key).and_then(|v| {
             let exp = v.get_expiration()?;
             Some(*exp)
         })
     }
 
-    pub(crate) fn set_key(&mut self, key: &RedisKey, value: StoredValue) -> Option<StoredValue> {
+    fn set_key(&mut self, key: &RedisKey, value: StoredValue) -> Option<StoredValue> {
         self.store.insert(key.clone(), value)
     }
 
-    pub(crate) fn remove_key(&mut self, key: &RedisKey) {
+    fn remove_key(&mut self, key: &RedisKey) {
         self.store.remove(key);
     }
 
-    pub(crate) fn rpush(
-        &mut self,
-        key: &RedisKey,
-        values: impl Iterator<Item = Bytes>,
-    ) -> Option<usize> {
+    fn rpush(&mut self, key: &RedisKey, values: impl Iterator<Item = Bytes>) -> Option<usize> {
         let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
             StoredValue::new(
                 RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
@@ -73,11 +69,7 @@ impl Database {
         Some(len)
     }
 
-    pub(crate) fn lpush(
-        &mut self,
-        key: &RedisKey,
-        values: impl Iterator<Item = Bytes>,
-    ) -> Option<usize> {
+    fn lpush(&mut self, key: &RedisKey, values: impl Iterator<Item = Bytes>) -> Option<usize> {
         let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
             StoredValue::new(
                 RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
@@ -112,7 +104,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Bytes>> {
+    fn lrange(&self, key: &RedisKey, start: isize, end: isize) -> Option<Vec<Bytes>> {
         let list = self.store.get(key)?;
         let list = list.as_list()?;
         // adjust negative start / end to actual indices
@@ -159,7 +151,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn llen(&self, key: &RedisKey) -> usize {
+    fn llen(&self, key: &RedisKey) -> usize {
         match self.store.get(key) {
             Some(v) => match v.as_list() {
                 Some(l) => l.len(),
@@ -169,25 +161,15 @@ impl Database {
         }
     }
 
-    pub(crate) fn lpop(&mut self, key: &RedisKey) -> Option<Bytes> {
-        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
-            StoredValue::new(
-                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
-                None,
-            )
-        });
+    fn lpop(&mut self, key: &RedisKey) -> Option<Bytes> {
+        let stored_value = self.store.get_mut(key)?;
 
         let list = stored_value.as_list_mut()?;
         list.pop_front()
     }
 
-    pub(crate) fn lpop_many(&mut self, key: &RedisKey, num_pops: usize) -> Option<Vec<Bytes>> {
-        let stored_value = self.store.entry(key.clone()).or_insert_with(|| {
-            StoredValue::new(
-                RedisDataType::List(VecDeque::with_capacity(INITIAL_CAPACITY)),
-                None,
-            )
-        });
+    fn lpop_many(&mut self, key: &RedisKey, num_pops: usize) -> Option<Vec<Bytes>> {
+        let stored_value = self.store.get_mut(key)?;
 
         let list = stored_value.as_list_mut()?;
         Some(
@@ -197,7 +179,7 @@ impl Database {
         )
     }
 
-    pub(crate) fn blpop(&mut self, key: &RedisKey) -> Receiver<Bytes> {
+    fn blpop(&mut self, key: &RedisKey) -> Receiver<Bytes> {
         // otherwise, we need to setup infrastructure to block until we are told something is
         // available on the list
         let (wait_tx, wait_rx) = oneshot::channel();
@@ -209,11 +191,27 @@ impl Database {
         wait_rx
     }
 
-    pub(crate) fn key_type(&self, key: &RedisKey) -> Option<&'static str> {
+    fn key_type(&self, key: &RedisKey) -> Option<&'static str> {
         Some(match self.store.get(key)?.value {
             RedisDataType::String(_) => "string",
             RedisDataType::List(_) => "list",
+            RedisDataType::Stream(_) => "stream",
         })
+    }
+
+    fn xadd(&mut self, stream_key: &Bytes, entry_id: &Bytes, pairs: Vec<Bytes>) -> Result<Bytes> {
+        let stored_value = self
+            .store
+            .entry(stream_key.clone())
+            .or_insert_with(|| StoredValue::new(RedisDataType::Stream(HashMap::new()), None));
+
+        let stream = stored_value
+            .as_stream_mut()
+            .ok_or(anyhow::anyhow!("Unable to get stream"))?;
+
+        let _ = stream.insert(entry_id.clone(), pairs);
+
+        Ok(entry_id.clone())
     }
 
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
@@ -337,6 +335,14 @@ impl Database {
                 self.key_type(&key_name)
                     .map(|s| RespValue::SimpleString(s.into()))
                     .unwrap_or(RespValue::SimpleString("none".into())),
+            )),
+            RedisCommand::XAdd {
+                stream_key,
+                entry_id,
+                pairs,
+            } => Ok(ExecutorResponse::Value(
+                self.xadd(&stream_key, &entry_id, pairs)
+                    .map(RespValue::BulkString)?,
             )),
         }
     }

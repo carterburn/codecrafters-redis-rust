@@ -64,6 +64,11 @@ pub(crate) enum RedisCommand {
     Type {
         key_name: Bytes,
     },
+    XAdd {
+        stream_key: Bytes,
+        entry_id: Bytes,
+        pairs: Vec<Bytes>,
+    },
 }
 
 impl RedisCommand {
@@ -196,6 +201,24 @@ impl RedisCommand {
             "TYPE" => {
                 let key_name = Self::expect_bulk_string(&values, 1)?;
                 Ok(Self::Type { key_name })
+            }
+            "XADD" => {
+                let stream_key = Self::expect_bulk_string(&values, 1)?;
+                let entry_id = Self::expect_bulk_string(&values, 2)?;
+
+                let pairs: Vec<Bytes> = values[3..]
+                    .iter()
+                    .filter_map(|rv| match rv {
+                        RespValue::BulkString(b) => Some(b.slice(..)),
+                        _ => None,
+                    })
+                    .collect();
+
+                Ok(Self::XAdd {
+                    stream_key,
+                    entry_id,
+                    pairs,
+                })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }

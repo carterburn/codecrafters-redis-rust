@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use bytes::Bytes;
 
@@ -8,6 +11,7 @@ pub(crate) type RedisKey = Bytes;
 pub enum RedisDataType {
     String(Bytes),
     List(VecDeque<Bytes>),
+    Stream(HashMap<Bytes, Vec<Bytes>>),
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +68,20 @@ impl StoredValue {
     pub(crate) fn as_list_mut(&mut self) -> Option<&mut VecDeque<Bytes>> {
         match &mut self.value {
             RedisDataType::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_stream(&self) -> Option<&HashMap<Bytes, Vec<Bytes>>> {
+        match &self.value {
+            RedisDataType::Stream(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_stream_mut(&mut self) -> Option<&mut HashMap<Bytes, Vec<Bytes>>> {
+        match &mut self.value {
+            RedisDataType::Stream(s) => Some(s),
             _ => None,
         }
     }
