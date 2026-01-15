@@ -225,11 +225,21 @@ impl Database {
         start: &Bytes,
         end: &Bytes,
     ) -> Option<Vec<(EntryId, Vec<Bytes>)>> {
-        let start: EntryId = EntryId::parse_range(start, true).ok()?;
-        let end: EntryId = EntryId::parse_range(end, false).ok()?;
-
         let stored_value = self.store.get(stream_key)?;
         let stream = stored_value.as_stream()?;
+
+        let start = if start == &b"-"[..] {
+            let (k, _) = stream.first_key_value()?;
+            *k
+        } else {
+            EntryId::parse_range(start, true).ok()?
+        };
+        let end = if end == &b"+"[..] {
+            let (k, _) = stream.last_key_value()?;
+            *k
+        } else {
+            EntryId::parse_range(end, false).ok()?
+        };
 
         let ret: Vec<(EntryId, Vec<Bytes>)> = stream
             .range(start..=end)
@@ -374,9 +384,9 @@ impl Database {
                 start,
                 end,
             } => {
-                let id_pairs = self
-                    .xrange(&stream_key, &start, &end)
-                    .ok_or(anyhow::anyhow!("Unable to retrieve XRANGE"))?;
+                let Some(id_pairs) = self.xrange(&stream_key, &start, &end) else {
+                    return Ok(ExecutorResponse::Value(RespValue::NullArray));
+                };
 
                 let outer: Vec<RespValue> = id_pairs
                     .iter()
