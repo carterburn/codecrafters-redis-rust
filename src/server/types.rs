@@ -210,7 +210,9 @@ impl EntryId {
                         let time_millis: i64 = time.parse()?;
                         let seq: usize = seq.parse()?;
                         if time_millis == 0 && seq == 0 {
-                            return Err(anyhow::anyhow!("ERR The ID specified in XADD is equal or smaller than the target stream top item"));
+                            return Err(anyhow::anyhow!(
+                                "ERR The ID specified in XADD must be greater than 0-0"
+                            ));
                         }
 
                         let milli_time = DateTime::from_timestamp_millis(time_millis)
