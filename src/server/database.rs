@@ -219,6 +219,26 @@ impl Database {
         Ok(response)
     }
 
+    fn xrange(
+        &self,
+        stream_key: &Bytes,
+        start: &Bytes,
+        end: &Bytes,
+    ) -> Option<Vec<(EntryId, Vec<Bytes>)>> {
+        let start: EntryId = EntryId::parse_range(start, true).ok()?;
+        let end: EntryId = EntryId::parse_range(end, false).ok()?;
+
+        let stored_value = self.store.get(stream_key)?;
+        let stream = stored_value.as_stream()?;
+
+        let ret: Vec<(EntryId, Vec<Bytes>)> = stream
+            .range(start..=end)
+            .map(|(id, pairs)| (*id, pairs.iter().map(|b| b.clone()).collect()))
+            .collect();
+
+        Some(ret)
+    }
+
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
         match cmd {
             RedisCommand::Ping => Ok(ExecutorResponse::Value(RespValue::SimpleString(
@@ -349,6 +369,32 @@ impl Database {
                 self.xadd(&stream_key, &entry_id, pairs)
                     .map(RespValue::BulkString)?,
             )),
+            RedisCommand::XRange {
+                stream_key,
+                start,
+                end,
+            } => {
+                let id_pairs = self
+                    .xrange(&stream_key, &start, &end)
+                    .ok_or(anyhow::anyhow!("Unable to retrieve XRANGE"))?;
+
+                let outer: Vec<RespValue> = id_pairs
+                    .iter()
+                    .map(|(entry_id, pairs)| {
+                        RespValue::Array(vec![
+                            RespValue::BulkString(format!("{}", entry_id).into()),
+                            RespValue::Array(
+                                pairs
+                                    .iter()
+                                    .map(|v| RespValue::BulkString(v.clone()))
+                                    .collect(),
+                            ),
+                        ])
+                    })
+                    .collect();
+
+                Ok(ExecutorResponse::Value(RespValue::Array(outer)))
+            }
         }
     }
 }

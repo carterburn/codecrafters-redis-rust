@@ -125,7 +125,7 @@ impl<'a> EntryIdFormat<'a> {
 /// EntryId for Streams
 /// Ord is derived in the order of the struct's fields, so milli_time must be first to compare the
 /// millisecond time then the sequence number if the millisecond times are equal.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct EntryId {
     /// The first portion of the Entry ID
     milli_time: DateTime<Utc>,
@@ -222,6 +222,33 @@ impl EntryId {
                         Ok(Self { milli_time, seq })
                     }
                 }
+            }
+        }
+    }
+
+    pub(crate) fn parse_range(value: &Bytes, lower: bool) -> Result<EntryId> {
+        // attempt to parse a full EntryId in the format: <millisecondTime>-<sequenceNumber>
+        // if no dash, use lower to determine sequence number for comparison
+        match memchr(b'-', value) {
+            Some(dash) => {
+                if dash == value.len() - 1 {
+                    return Err(anyhow::anyhow!("Improper value format for EntryID"));
+                }
+                let milli_time =
+                    DateTime::from_timestamp_millis(str::from_utf8(&value[..dash])?.parse()?)
+                        .ok_or(anyhow::anyhow!("Invalid millisecondTime"))?;
+                let seq = str::from_utf8(&value[dash + 1..])?.parse()?;
+                Ok(Self { milli_time, seq })
+            }
+            None => {
+                // only have the millisecond time
+                let milli_time =
+                    DateTime::from_timestamp_millis(str::from_utf8(&value[..])?.parse()?)
+                        .ok_or(anyhow::anyhow!("Invalid millisecondTime"))?;
+
+                let seq = if lower { 0 } else { usize::MAX };
+
+                Ok(Self { milli_time, seq })
             }
         }
     }

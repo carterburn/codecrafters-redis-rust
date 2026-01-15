@@ -9,7 +9,7 @@ use crate::{
     resp::RespValue,
     server::{
         database::Database,
-        types::{RedisDataType, StoredValue},
+        types::{EntryId, RedisDataType, StoredValue},
     },
 };
 
@@ -68,6 +68,11 @@ pub(crate) enum RedisCommand {
         stream_key: Bytes,
         entry_id: Bytes,
         pairs: Vec<Bytes>,
+    },
+    XRange {
+        stream_key: Bytes,
+        start: Bytes,
+        end: Bytes,
     },
 }
 
@@ -218,6 +223,17 @@ impl RedisCommand {
                     stream_key,
                     entry_id,
                     pairs,
+                })
+            }
+            "XRANGE" => {
+                let stream_key = Self::expect_bulk_string(&values, 1)?;
+                let start = Self::expect_bulk_string(&values, 2)?;
+                let end = Self::expect_bulk_string(&values, 3)?;
+
+                Ok(Self::XRange {
+                    stream_key,
+                    start,
+                    end,
                 })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
