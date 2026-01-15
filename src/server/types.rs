@@ -198,6 +198,12 @@ impl EntryId {
                         } else if milli_time == last_key.milli_time {
                             // seq has to be greater than last_key's seq
                             if seq <= last_key.seq {
+                                if time_millis == 0 && seq == 0 {
+                                    // special error in this branch
+                                    return Err(anyhow::anyhow!(
+                                        "ERR The ID specified in XADD must be greater than 0-0"
+                                    ));
+                                }
                                 return Err(anyhow::anyhow!("ERR The ID specified in XADD is equal or smaller than the target stream top item"));
                             }
                         }
