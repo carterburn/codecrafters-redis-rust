@@ -184,6 +184,12 @@ impl EntryId {
                 }
             }
             EntryIdFormat::TimeSeq { time, seq } => {
+                // before doing any logic, check if we have a 0-0 case
+                if time == "0" && seq == "0" {
+                    return Err(anyhow::anyhow!(
+                        "ERR The ID specified in XADD must be greater than 0-0"
+                    ));
+                }
                 // user specified everything
                 match last_kv {
                     Some((last_key, _)) => {
@@ -198,12 +204,6 @@ impl EntryId {
                         } else if milli_time == last_key.milli_time {
                             // seq has to be greater than last_key's seq
                             if seq <= last_key.seq {
-                                if time_millis == 0 && seq == 0 {
-                                    // special error in this branch
-                                    return Err(anyhow::anyhow!(
-                                        "ERR The ID specified in XADD must be greater than 0-0"
-                                    ));
-                                }
                                 return Err(anyhow::anyhow!("ERR The ID specified in XADD is equal or smaller than the target stream top item"));
                             }
                         }
@@ -215,11 +215,6 @@ impl EntryId {
                         // stream empty, just needs to be greater than 0-0
                         let time_millis: i64 = time.parse()?;
                         let seq: usize = seq.parse()?;
-                        if time_millis == 0 && seq == 0 {
-                            return Err(anyhow::anyhow!(
-                                "ERR The ID specified in XADD must be greater than 0-0"
-                            ));
-                        }
 
                         let milli_time = DateTime::from_timestamp_millis(time_millis)
                             .ok_or(anyhow::anyhow!("Time creation failed: invalid time"))?;
