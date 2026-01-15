@@ -1,10 +1,10 @@
 use crate::command::{ExecutorResponse, RedisCommand};
-use crate::resp::RespValue;
-use crate::server::types::{RedisDataType, RedisKey, StoredValue};
+use crate::resp::{self, RespValue};
+use crate::server::types::{EntryId, RedisDataType, RedisKey, StoredValue};
 use anyhow::Result;
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot::{self, Receiver};
@@ -203,15 +203,20 @@ impl Database {
         let stored_value = self
             .store
             .entry(stream_key.clone())
-            .or_insert_with(|| StoredValue::new(RedisDataType::Stream(HashMap::new()), None));
+            .or_insert_with(|| StoredValue::new(RedisDataType::Stream(BTreeMap::new()), None));
 
         let stream = stored_value
             .as_stream_mut()
             .ok_or(anyhow::anyhow!("Unable to get stream"))?;
 
-        let _ = stream.insert(entry_id.clone(), pairs);
+        let last_kv = stream.last_key_value();
 
-        Ok(entry_id.clone())
+        let id = EntryId::construct(entry_id, last_kv)?;
+        let response = format!("{}", id).into();
+
+        let _ = stream.insert(id, pairs);
+
+        Ok(response)
     }
 
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
