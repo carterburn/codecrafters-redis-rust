@@ -261,3 +261,4 @@ impl std::fmt::Display for EntryId {
 }
 
 pub(crate) type ExpiryEvent = (Instant, RedisKey);
+pub(crate) type XReadReturn = Vec<(Bytes, Vec<(EntryId, Vec<Bytes>)>)>;

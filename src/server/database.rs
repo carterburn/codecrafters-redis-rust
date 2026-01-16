@@ -1,10 +1,11 @@
 use crate::command::{ExecutorResponse, RedisCommand};
 use crate::resp::{self, RespValue};
-use crate::server::types::{EntryId, RedisDataType, RedisKey, StoredValue};
+use crate::server::types::{EntryId, RedisDataType, RedisKey, StoredValue, XReadReturn};
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot::{self, Receiver};
@@ -249,6 +250,55 @@ impl Database {
         Some(ret)
     }
 
+    fn xread_single_stream(
+        &self,
+        stream_key: Bytes,
+        start_id: EntryId,
+    ) -> Option<Vec<(EntryId, Vec<Bytes>)>> {
+        let stored_value = self.store.get(&stream_key)?;
+        let stream = stored_value.as_stream()?;
+
+        Some(
+            stream
+                .range((Bound::Excluded(&start_id), Bound::Unbounded))
+                //                  cheap-ish clone with Bytes
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+        )
+    }
+
+    //                                          streams
+    //  Array (higher function takes that)
+    //  Vec of ("stream_id", Vec<(EntryId, Vec<Bytes>)>)
+    fn xread(&self, streams: Vec<Bytes>) -> Option<XReadReturn> {
+        // continually try to parse EntryIDs, if it fails, assume it is a stream
+        let mut stream_keys = vec![];
+        let mut ids = vec![];
+        for s in streams {
+            match EntryId::parse_range(&s, true) {
+                Ok(id) => ids.push(id),
+                Err(_) => stream_keys.push(s.clone()),
+            }
+        }
+        tracing::info!("Parsed streams: {stream_keys:?} with ID: {ids:?}");
+
+        if stream_keys.len() != ids.len() {
+            tracing::error!("Non-matching stream_keys with IDs");
+            return None;
+        }
+
+        // for each stream, id pair, we will construct the Vec<(EntryId, Vec<Bytes>)>
+        Some(
+            stream_keys
+                .iter()
+                .zip(ids)
+                .filter_map(|(key, start)| {
+                    Some((key.clone(), self.xread_single_stream(key.clone(), start)?))
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
         match cmd {
             RedisCommand::Ping => Ok(ExecutorResponse::Value(RespValue::SimpleString(
@@ -388,17 +438,21 @@ impl Database {
                     return Ok(ExecutorResponse::Value(RespValue::NullArray));
                 };
 
-                let outer: Vec<RespValue> = id_pairs
-                    .iter()
-                    .map(|(entry_id, pairs)| {
+                let outer = Self::entry_id_pairs_to_array(id_pairs);
+
+                Ok(ExecutorResponse::Value(RespValue::Array(outer)))
+            }
+            RedisCommand::XRead { streams } => {
+                let Some(streams) = self.xread(streams) else {
+                    return Ok(ExecutorResponse::Value(RespValue::NullArray));
+                };
+
+                let outer: Vec<RespValue> = streams
+                    .into_iter()
+                    .map(|(stream_key, id_pairs)| {
                         RespValue::Array(vec![
-                            RespValue::BulkString(format!("{}", entry_id).into()),
-                            RespValue::Array(
-                                pairs
-                                    .iter()
-                                    .map(|v| RespValue::BulkString(v.clone()))
-                                    .collect(),
-                            ),
+                            RespValue::BulkString(stream_key.clone()),
+                            RespValue::Array(Self::entry_id_pairs_to_array(id_pairs)),
                         ])
                     })
                     .collect();
@@ -406,5 +460,22 @@ impl Database {
                 Ok(ExecutorResponse::Value(RespValue::Array(outer)))
             }
         }
+    }
+
+    fn entry_id_pairs_to_array(id_pairs: Vec<(EntryId, Vec<Bytes>)>) -> Vec<RespValue> {
+        id_pairs
+            .iter()
+            .map(|(entry_id, pairs)| {
+                RespValue::Array(vec![
+                    RespValue::BulkString(format!("{}", entry_id).into()),
+                    RespValue::Array(
+                        pairs
+                            .iter()
+                            .map(|v| RespValue::BulkString(v.clone()))
+                            .collect(),
+                    ),
+                ])
+            })
+            .collect()
     }
 }

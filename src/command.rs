@@ -74,6 +74,9 @@ pub(crate) enum RedisCommand {
         start: Bytes,
         end: Bytes,
     },
+    XRead {
+        streams: Vec<Bytes>,
+    },
 }
 
 impl RedisCommand {
@@ -235,6 +238,27 @@ impl RedisCommand {
                     start,
                     end,
                 })
+            }
+            "XREAD" => {
+                let stream_key = Self::expect_bulk_string(&values, 1)?;
+                let stream_key = str::from_utf8(&stream_key[..])?;
+                if stream_key.to_uppercase() != "STREAMS" {
+                    return Err(anyhow::anyhow!("Missing STREAMS after XREAD"));
+                }
+
+                let streams: Vec<Bytes> = values[2..]
+                    .iter()
+                    .filter_map(|v| match v {
+                        RespValue::BulkString(b) => Some(b.slice(..)),
+                        _ => None,
+                    })
+                    .collect();
+
+                if streams.len() % 2 != 0 {
+                    return Err(anyhow::anyhow!("Not enough streams and Entry IDs"));
+                }
+
+                Ok(Self::XRead { streams })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }
