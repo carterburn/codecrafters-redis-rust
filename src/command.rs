@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     resp::RespValue,
@@ -25,6 +25,10 @@ pub(crate) enum ExecutorResponse {
         rx: oneshot::Receiver<Bytes>,
         key: Bytes,
         timeout: f64,
+    },
+    XReadBlock {
+        rx: mpsc::Receiver<RespValue>,
+        timeout: u64,
     },
 }
 
@@ -76,6 +80,7 @@ pub(crate) enum RedisCommand {
     },
     XRead {
         streams: Vec<Bytes>,
+        timeout: Option<usize>,
     },
 }
 
@@ -240,13 +245,32 @@ impl RedisCommand {
                 })
             }
             "XREAD" => {
-                let stream_key = Self::expect_bulk_string(&values, 1)?;
-                let stream_key = str::from_utf8(&stream_key[..])?;
-                if stream_key.to_uppercase() != "STREAMS" {
-                    return Err(anyhow::anyhow!("Missing STREAMS after XREAD"));
-                }
+                let opt = Self::expect_bulk_string(&values, 1)?;
+                let opt = str::from_utf8(&opt[..])?;
+                let timeout = match opt.to_uppercase().as_str() {
+                    "BLOCK" => {
+                        let value = Self::expect_bulk_string(&values, 2)?;
+                        let value: usize = str::from_utf8(&value[..])?.parse()?;
+                        Some(value)
+                    }
+                    "STREAMS" => None,
+                    _ => {
+                        return Err(anyhow::anyhow!("Missing BLOCK or STREAMS after XREAD"));
+                    }
+                };
 
-                let streams: Vec<Bytes> = values[2..]
+                let rest = if timeout.is_some() {
+                    let stream_word = Self::expect_bulk_string(&values, 3)?;
+                    let stream_word = str::from_utf8(&stream_word[..])?;
+                    if stream_word.to_uppercase().as_str() != "STREAMS" {
+                        return Err(anyhow::anyhow!("Missing STREAMS in XREAD command"));
+                    }
+                    &values[4..]
+                } else {
+                    &values[2..]
+                };
+
+                let streams: Vec<Bytes> = rest
                     .iter()
                     .filter_map(|v| match v {
                         RespValue::BulkString(b) => Some(b.slice(..)),
@@ -254,11 +278,11 @@ impl RedisCommand {
                     })
                     .collect();
 
-                if streams.len() % 2 != 0 {
+                if !streams.len().is_multiple_of(2) {
                     return Err(anyhow::anyhow!("Not enough streams and Entry IDs"));
                 }
 
-                Ok(Self::XRead { streams })
+                Ok(Self::XRead { streams, timeout })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }

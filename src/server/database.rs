@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot::{self, Receiver};
+use tokio::sync::{
+    mpsc,
+    oneshot::{self, Receiver},
+};
 
 pub(crate) const INITIAL_CAPACITY: usize = 16;
 
@@ -18,6 +21,9 @@ pub(crate) struct Database {
 
     /// clients waiting on blpop
     blocking: HashMap<RedisKey, VecDeque<oneshot::Sender<Bytes>>>,
+
+    /// clients waiting on xread
+    xread_block: HashMap<RedisKey, Vec<(EntryId, mpsc::Sender<RespValue>)>>,
 }
 
 impl Database {
@@ -25,6 +31,7 @@ impl Database {
         Self {
             store: HashMap::with_capacity(INITIAL_CAPACITY),
             blocking: HashMap::with_capacity(INITIAL_CAPACITY),
+            xread_block: HashMap::with_capacity(INITIAL_CAPACITY),
         }
     }
 
@@ -215,9 +222,42 @@ impl Database {
         let id = EntryId::construct(entry_id, last_kv)?;
         let response = format!("{}", id).into();
 
-        let _ = stream.insert(id, pairs);
+        let _ = stream.insert(id.clone(), pairs);
+
+        // now that we insert, we should attempt to notify any blockers on this key
+        self.notify_xread_block(stream_key, id);
 
         Ok(response)
+    }
+
+    fn notify_xread_block(&mut self, stream_key: &Bytes, new_id: EntryId) {
+        if let Some(waiters) = self.xread_block.get_mut(stream_key) {
+            waiters.retain(|(id, sender)| {
+                if new_id > *id {
+                    // have to do the xread single stream by hand here and not call the helper to
+                    // avoid borrow issues
+                    let Some(stored_value) = self.store.get(stream_key) else {
+                        return true;
+                    };
+                    let Some(stream) = stored_value.as_stream() else {
+                        return true;
+                    };
+                    let pairs: Vec<(EntryId, Vec<Bytes>)> = stream
+                        .range((Bound::Excluded(id), Bound::Unbounded))
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect();
+                    let msg = RespValue::Array(vec![RespValue::Array(vec![
+                        RespValue::BulkString(stream_key.clone()),
+                        RespValue::Array(Self::entry_id_pairs_to_array(pairs)),
+                    ])]);
+                    tracing::info!("Sending msg to alert client");
+                    let _ = sender.try_send(msg);
+                    false // don't need to keep this entry as a waiter anymore
+                } else {
+                    true
+                }
+            })
+        }
     }
 
     fn xrange(
@@ -258,13 +298,16 @@ impl Database {
         let stored_value = self.store.get(&stream_key)?;
         let stream = stored_value.as_stream()?;
 
-        Some(
-            stream
-                .range((Bound::Excluded(&start_id), Bound::Unbounded))
-                //                  cheap-ish clone with Bytes
-                .map(|(k, v)| (*k, v.clone()))
-                .collect(),
-        )
+        let ret: Vec<(EntryId, Vec<Bytes>)> = stream
+            .range((Bound::Excluded(&start_id), Bound::Unbounded))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        if ret.is_empty() {
+            None
+        } else {
+            Some(ret)
+        }
     }
 
     //                                          streams
@@ -272,31 +315,77 @@ impl Database {
     //  Vec of ("stream_id", Vec<(EntryId, Vec<Bytes>)>)
     fn xread(&self, streams: Vec<Bytes>) -> Option<XReadReturn> {
         // continually try to parse EntryIDs, if it fails, assume it is a stream
+        let stream_keys = Self::parse_stream_ids(&streams)?;
+
+        // for each stream, id pair, we will construct the Vec<(EntryId, Vec<Bytes>)>
+        let ret: XReadReturn = stream_keys
+            .into_iter()
+            .filter_map(|(key, start)| {
+                Some((key.clone(), self.xread_single_stream(key.clone(), start)?))
+            })
+            .collect();
+
+        tracing::info!("ret len: {}", ret.len());
+
+        if ret.is_empty() {
+            None
+        } else {
+            Some(ret)
+        }
+    }
+
+    fn parse_stream_ids(streams: &Vec<Bytes>) -> Option<Vec<(Bytes, EntryId)>> {
         let mut stream_keys = vec![];
         let mut ids = vec![];
         for s in streams {
-            match EntryId::parse_range(&s, true) {
+            match EntryId::parse_range(s, true) {
                 Ok(id) => ids.push(id),
                 Err(_) => stream_keys.push(s.clone()),
             }
         }
-        tracing::info!("Parsed streams: {stream_keys:?} with ID: {ids:?}");
-
         if stream_keys.len() != ids.len() {
             tracing::error!("Non-matching stream_keys with IDs");
             return None;
         }
+        Some(stream_keys.into_iter().zip(ids).collect())
+    }
 
-        // for each stream, id pair, we will construct the Vec<(EntryId, Vec<Bytes>)>
-        Some(
-            stream_keys
-                .iter()
-                .zip(ids)
-                .filter_map(|(key, start)| {
-                    Some((key.clone(), self.xread_single_stream(key.clone(), start)?))
+    fn blocking_xread(&mut self, streams: Vec<Bytes>, timeout: usize) -> Result<ExecutorResponse> {
+        let stream_keys =
+            Self::parse_stream_ids(&streams).ok_or(anyhow::anyhow!("Invalid streams and IDs"))?;
+
+        // check if any of the streams have data to pass back now
+        if let Some(data) = self.xread(streams) {
+            let outer: Vec<RespValue> = data
+                .into_iter()
+                .map(|(stream_key, id_pairs)| {
+                    RespValue::Array(vec![
+                        RespValue::BulkString(stream_key.clone()),
+                        RespValue::Array(Self::entry_id_pairs_to_array(id_pairs)),
+                    ])
                 })
-                .collect(),
-        )
+                .collect();
+
+            tracing::info!("outer: {}", outer.len());
+
+            return Ok(ExecutorResponse::Value(RespValue::Array(outer)));
+        }
+
+        // otherwise, for every stream / id pair, we add to the list of waiters waiting on the
+        // streams
+        // we create a cloneable oneshot so that the client can wait on multiple streams
+        let (tx, rx) = mpsc::channel(1);
+        for (key, id) in stream_keys {
+            self.xread_block
+                .entry(key.clone())
+                .or_insert_with(Vec::new)
+                .push((id, tx.clone()))
+        }
+
+        Ok(ExecutorResponse::XReadBlock {
+            rx,
+            timeout: timeout.try_into()?,
+        })
     }
 
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
@@ -442,7 +531,11 @@ impl Database {
 
                 Ok(ExecutorResponse::Value(RespValue::Array(outer)))
             }
-            RedisCommand::XRead { streams } => {
+            RedisCommand::XRead { streams, timeout } => {
+                if let Some(to_value) = timeout {
+                    return self.blocking_xread(streams, to_value);
+                }
+
                 let Some(streams) = self.xread(streams) else {
                     return Ok(ExecutorResponse::Value(RespValue::NullArray));
                 };

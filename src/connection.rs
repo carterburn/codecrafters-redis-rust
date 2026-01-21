@@ -87,6 +87,10 @@ impl RedisConnection {
                             let block_response = self.block(rx, key, timeout).await;
                             let _ = self.frame.send(block_response).await;
                         }
+                        ExecutorResponse::XReadBlock { rx, timeout } => {
+                            let block_response = self.xread_block(rx, timeout).await;
+                            let _ = self.frame.send(block_response).await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -121,6 +125,25 @@ impl RedisConnection {
             },
             Ok(value) = rx => {
                 RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value.clone())])
+            }
+        }
+    }
+
+    async fn xread_block(&mut self, mut rx: mpsc::Receiver<RespValue>, timeout: u64) -> RespValue {
+        tokio::select! {
+            _ = async {
+                if timeout == 0 {
+                    tracing::info!("Indefinite wait on XRead for key");
+                    std::future::pending::<()>().await
+                } else {
+                    tracing::info!("Waiting for {timeout}");
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(Instant::now() + Duration::from_millis(timeout))).await
+                }
+            } => {
+                RespValue::NullArray
+            },
+            Some(value) = rx.recv() => {
+                value
             }
         }
     }
