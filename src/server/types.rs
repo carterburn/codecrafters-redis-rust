@@ -226,6 +226,13 @@ impl EntryId {
         }
     }
 
+    pub(crate) fn create_min() -> Self {
+        Self {
+            milli_time: DateTime::from_timestamp_nanos(0),
+            seq: 0,
+        }
+    }
+
     pub(crate) fn parse_range(value: &Bytes, lower: bool) -> Result<EntryId> {
         // attempt to parse a full EntryId in the format: <millisecondTime>-<sequenceNumber>
         // if no dash, use lower to determine sequence number for comparison

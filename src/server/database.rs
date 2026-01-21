@@ -231,8 +231,10 @@ impl Database {
     }
 
     fn notify_xread_block(&mut self, stream_key: &Bytes, new_id: EntryId) {
+        tracing::info!("{:?}", self.xread_block);
         if let Some(waiters) = self.xread_block.get_mut(stream_key) {
             waiters.retain(|(id, sender)| {
+                tracing::info!("ID: {id:?}");
                 if new_id > *id {
                     // have to do the xread single stream by hand here and not call the helper to
                     // avoid borrow issues
@@ -315,7 +317,7 @@ impl Database {
     //  Vec of ("stream_id", Vec<(EntryId, Vec<Bytes>)>)
     fn xread(&self, streams: Vec<Bytes>) -> Option<XReadReturn> {
         // continually try to parse EntryIDs, if it fails, assume it is a stream
-        let stream_keys = Self::parse_stream_ids(&streams)?;
+        let stream_keys = self.parse_stream_ids(&streams)?;
 
         // for each stream, id pair, we will construct the Vec<(EntryId, Vec<Bytes>)>
         let ret: XReadReturn = stream_keys
@@ -334,12 +336,21 @@ impl Database {
         }
     }
 
-    fn parse_stream_ids(streams: &Vec<Bytes>) -> Option<Vec<(Bytes, EntryId)>> {
+    fn parse_stream_ids(&self, streams: &Vec<Bytes>) -> Option<Vec<(Bytes, EntryId)>> {
+        enum Id {
+            Exact(EntryId),
+            Dollar,
+        }
+
         let mut stream_keys = vec![];
         let mut ids = vec![];
         for s in streams {
+            if s == &b"$"[..] {
+                ids.push(Id::Dollar);
+                continue;
+            }
             match EntryId::parse_range(s, true) {
-                Ok(id) => ids.push(id),
+                Ok(id) => ids.push(Id::Exact(id)),
                 Err(_) => stream_keys.push(s.clone()),
             }
         }
@@ -347,12 +358,37 @@ impl Database {
             tracing::error!("Non-matching stream_keys with IDs");
             return None;
         }
-        Some(stream_keys.into_iter().zip(ids).collect())
+        let stream_ids: Vec<(Bytes, Id)> = stream_keys.into_iter().zip(ids).collect();
+        Some(
+            stream_ids
+                .into_iter()
+                .filter_map(|(stream_key, id)| match id {
+                    Id::Exact(id) => Some((stream_key, id)),
+                    Id::Dollar => {
+                        match self.store.get(&stream_key) {
+                            Some(sv) => {
+                                let stream = sv.as_stream()?;
+                                match stream.last_key_value() {
+                                    Some((k, _)) => Some((stream_key, *k)),
+                                    None => Some((stream_key, EntryId::create_min())),
+                                }
+                            }
+                            None => {
+                                // stream not created yet, so just save off when we get there with
+                                // the absolute min
+                                Some((stream_key, EntryId::create_min()))
+                            }
+                        }
+                    }
+                })
+                .collect(),
+        )
     }
 
     fn blocking_xread(&mut self, streams: Vec<Bytes>, timeout: usize) -> Result<ExecutorResponse> {
-        let stream_keys =
-            Self::parse_stream_ids(&streams).ok_or(anyhow::anyhow!("Invalid streams and IDs"))?;
+        let stream_keys = self
+            .parse_stream_ids(&streams)
+            .ok_or(anyhow::anyhow!("Invalid streams and IDs"))?;
 
         // check if any of the streams have data to pass back now
         if let Some(data) = self.xread(streams) {
