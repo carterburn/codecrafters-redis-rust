@@ -610,6 +610,38 @@ impl Database {
 
                 Ok(ExecutorResponse::Value(RespValue::Integer(updated)))
             }
+            RedisCommand::Multi => {
+                // this should not be handled by the database executor as this is something the
+                // client handler will take care of
+                unreachable!();
+            }
+            RedisCommand::Exec => {
+                // this should also be handled by the database executor
+                unreachable!();
+            }
+            RedisCommand::Transaction { commands } => {
+                // iterate through each of the commands and collect the ExecutorResponse for each
+                let mut responses = vec![];
+                for c in commands {
+                    responses.push(self.handle_cmd(c));
+                }
+                let values: Vec<RespValue> = responses
+                    .into_iter()
+                    .map(|r| {
+                        match r {
+                            Ok(ExecutorResponse::Value(v)) => v,
+                            Ok(_) => {
+                                // for now, we'll just put an error, but we probably shouldn't let
+                                // clients do blocking calls in a transaction..?
+                                RespValue::SimpleError("Blocking call in transaction".into())
+                            }
+                            Err(e) => RespValue::SimpleError(format!("{e:?}").into()),
+                        }
+                    })
+                    .collect();
+
+                Ok(ExecutorResponse::Value(RespValue::Array(values)))
+            }
         }
     }
 

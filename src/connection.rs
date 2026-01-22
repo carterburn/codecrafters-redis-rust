@@ -47,11 +47,12 @@ impl RedisConnection {
     }
 
     pub(crate) async fn client_loop(&mut self) {
+        let mut transaction: Option<Vec<RedisCommand>> = None;
         while let Some(result) = self.frame.next().await {
             match result {
                 Ok(message) => {
                     tracing::info!("Received RESP value: {message:?}");
-                    let cmd = match RedisCommand::parse(message) {
+                    let mut cmd = match RedisCommand::parse(message) {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::error!("Error while parsing command: {e:?}");
@@ -59,6 +60,45 @@ impl RedisConnection {
                             continue;
                         }
                     };
+
+                    // check if these are transaction based commands, because we take certain
+                    // actions if that's the case
+                    if let RedisCommand::Multi = cmd {
+                        if transaction.is_some() {
+                            // error case: multi inside a multi is not possible
+                            self.send_error(anyhow::anyhow!("Duplicate MULTI commands"))
+                                .await;
+                        } else {
+                            // start up the transaction tracking
+                            transaction = Some(vec![]);
+                            let _ = self.frame.send(RespValue::SimpleString("OK".into())).await;
+                        }
+                        continue;
+                    }
+
+                    if let RedisCommand::Exec = cmd {
+                        let Some(cmds) = transaction.take() else {
+                            // no transaction started, error
+                            self.send_error(anyhow::anyhow!("ERR EXEC without MULTI"))
+                                .await;
+                            continue;
+                        };
+
+                        // everything is properly setup for transaction, so replace cmd with the
+                        // transaction command
+                        cmd = RedisCommand::Transaction { commands: cmds };
+                        // this continues on down to send to the executor
+                    }
+
+                    if let Some(ref mut cmds) = transaction {
+                        // currently in a transaction so queue up this command and continue looping
+                        cmds.push(cmd);
+                        let _ = self
+                            .frame
+                            .send(RespValue::SimpleString("QUEUED".into()))
+                            .await;
+                        continue;
+                    }
 
                     let (tx, rx) = oneshot::channel();
                     if let Err(e) = self
