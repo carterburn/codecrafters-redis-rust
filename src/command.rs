@@ -82,6 +82,9 @@ pub(crate) enum RedisCommand {
         streams: Vec<Bytes>,
         timeout: Option<usize>,
     },
+    Incr {
+        key: Bytes,
+    },
 }
 
 impl RedisCommand {
@@ -283,6 +286,11 @@ impl RedisCommand {
                 }
 
                 Ok(Self::XRead { streams, timeout })
+            }
+            "INCR" => {
+                let key = Self::expect_bulk_string(&values, 1)?;
+
+                Ok(Self::Incr { key })
             }
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }

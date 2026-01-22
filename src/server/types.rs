@@ -13,6 +13,7 @@ pub(crate) type RedisKey = Bytes;
 #[derive(Clone, Debug)]
 pub enum RedisDataType {
     String(Bytes),
+    Integer(i64),
     List(VecDeque<Bytes>),
     Stream(BTreeMap<EntryId, Vec<Bytes>>),
 }
@@ -54,6 +55,17 @@ impl StoredValue {
         self.expiration.as_ref()
     }
 
+    /// Since all return values from GET need to be Bulk Strings (Bytes for us), we should convert
+    /// any integers to bytes as well before returning to a client.
+    pub(crate) fn as_return_value(&self) -> Option<Bytes> {
+        match &self.value {
+            RedisDataType::String(s) => Some(s.slice(..)),
+            RedisDataType::Integer(i) => Some(i.to_string().into()),
+            // everything else is still None (can't use GET to retrieve them)
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_string(&self) -> Option<Bytes> {
         match &self.value {
             RedisDataType::String(s) => Some(s.slice(..)),
@@ -85,6 +97,30 @@ impl StoredValue {
     pub(crate) fn as_stream_mut(&mut self) -> Option<&mut BTreeMap<EntryId, Vec<Bytes>>> {
         match &mut self.value {
             RedisDataType::Stream(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_int(&self) -> Option<&i64> {
+        match &self.value {
+            RedisDataType::Integer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_int_mut(&mut self) -> Option<&mut i64> {
+        // if we have a string as this type, first we try to convert it, if we can't then this
+        // value could never be interpretted as a string anyway...
+        if let RedisDataType::String(b) = &self.value {
+            let int: i64 = str::from_utf8(&b[..]).ok()?.parse().ok()?;
+            self.value = RedisDataType::Integer(int);
+        };
+
+        // if we don't have a string, then we hope we have an integer. otherwise, it's None all the
+        // way down
+
+        match &mut self.value {
+            RedisDataType::Integer(i) => Some(i),
             _ => None,
         }
     }

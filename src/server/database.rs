@@ -39,7 +39,7 @@ impl Database {
     pub(crate) fn get_key(&self, key: &RedisKey) -> Option<Bytes> {
         self.store.get(key).and_then(|v| {
             if !v.expired(Instant::now()) {
-                v.as_string()
+                v.as_return_value()
             } else {
                 None
             }
@@ -204,6 +204,8 @@ impl Database {
             RedisDataType::String(_) => "string",
             RedisDataType::List(_) => "list",
             RedisDataType::Stream(_) => "stream",
+            // integer's are still strings to the Redis world
+            RedisDataType::Integer(_) => "string",
         })
     }
 
@@ -231,10 +233,8 @@ impl Database {
     }
 
     fn notify_xread_block(&mut self, stream_key: &Bytes, new_id: EntryId) {
-        tracing::info!("{:?}", self.xread_block);
         if let Some(waiters) = self.xread_block.get_mut(stream_key) {
             waiters.retain(|(id, sender)| {
-                tracing::info!("ID: {id:?}");
                 if new_id > *id {
                     // have to do the xread single stream by hand here and not call the helper to
                     // avoid borrow issues
@@ -424,6 +424,23 @@ impl Database {
         })
     }
 
+    fn incr(&mut self, key: &Bytes) -> Result<i64> {
+        let stored_value = self
+            .store
+            .entry(key.clone())
+            .or_insert_with(|| StoredValue::new(RedisDataType::Integer(0), None));
+
+        // Attempt to get the key as an integer through StoredValue API. If the key exists and can
+        // be interpreted as an integer, it is casted as such
+        let int = stored_value.as_int_mut().ok_or(anyhow::anyhow!(
+            "ERR value is not an integer or out of range"
+        ))?;
+
+        // increment the integer and return it
+        *int += 1;
+        Ok(*int)
+    }
+
     pub(crate) fn handle_cmd(&mut self, cmd: RedisCommand) -> Result<ExecutorResponse> {
         match cmd {
             RedisCommand::Ping => Ok(ExecutorResponse::Value(RespValue::SimpleString(
@@ -587,6 +604,11 @@ impl Database {
                     .collect();
 
                 Ok(ExecutorResponse::Value(RespValue::Array(outer)))
+            }
+            RedisCommand::Incr { key } => {
+                let updated = self.incr(&key)?;
+
+                Ok(ExecutorResponse::Value(RespValue::Integer(updated)))
             }
         }
     }
