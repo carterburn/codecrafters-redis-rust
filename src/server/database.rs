@@ -615,8 +615,12 @@ impl Database {
                 // client handler will take care of
                 unreachable!();
             }
+            RedisCommand::Discard => {
+                // handled by client
+                unreachable!();
+            }
             RedisCommand::Exec => {
-                // this should also be handled by the database executor
+                // this should also not be handled by the database executor
                 unreachable!();
             }
             RedisCommand::Transaction { commands } => {

@@ -76,6 +76,16 @@ impl RedisConnection {
                         continue;
                     }
 
+                    if let RedisCommand::Discard = cmd {
+                        // abort the transaction iff a transaction was started
+                        let ret = match transaction.take() {
+                            Some(_c) => RespValue::SimpleString("OK".into()),
+                            None => RespValue::SimpleError("ERR DISCARD without MULTI".into()),
+                        };
+                        let _ = self.frame.send(ret).await;
+                        continue;
+                    }
+
                     if let RedisCommand::Exec = cmd {
                         let Some(cmds) = transaction.take() else {
                             // no transaction started, error

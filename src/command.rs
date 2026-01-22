@@ -87,6 +87,7 @@ pub(crate) enum RedisCommand {
     },
     Multi,
     Exec,
+    Discard,
     Transaction {
         commands: Vec<RedisCommand>,
     },
@@ -298,6 +299,7 @@ impl RedisCommand {
                 Ok(Self::Incr { key })
             }
             "MULTI" => Ok(Self::Multi),
+            "DISCARD" => Ok(Self::Discard),
             "EXEC" => Ok(Self::Exec),
             _ => Err(anyhow::anyhow!("Unsupported command: {cmd:?}")),
         }
